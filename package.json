@@ -6,7 +6,7 @@
   "scripts": {
     "start": "expo start",
     "web": "expo start --web",
-    "build": "expo export --platform web",
+    "build": "node ./node_modules/expo/bin/cli export --platform web --output-dir dist",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
