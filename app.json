@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "RetailFlow",
+    "slug": "retailflow-pos",
+    "version": "1.0.0",
+    "orientation": "landscape",
+    "platforms": ["web", "ios", "android"],
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
