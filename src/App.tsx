@@ -1,4 +1,5 @@
 import React, { createContext, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Navigate,
   NavLink,
@@ -36,6 +37,7 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { BrowserMultiFormatReader } from "@zxing/browser/cjs";
 import {
   Bar,
   BarChart,
@@ -45,9 +47,24 @@ import {
   YAxis,
 } from "recharts";
 import "./styles.css";
+import { generateBarcodeSVG, generateEAN13 } from "./utils/barcodeGenerator";
+import { getScannerMethod, isMobileBrowser, requestCameraPermission } from "./utils/barcodeScanner";
+import { LabelSize, printLabels } from "./utils/printLabels";
 
 type UnitType = "piece" | "kg" | "meter" | "liter";
 type StaffRole = "Owner" | "Manager" | "Cashier";
+type BarcodeDetectorResult = { rawValue: string };
+type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => {
+  detect: (source: HTMLVideoElement) => Promise<BarcodeDetectorResult[]>;
+};
+
+function safeBarcodeSVG(value: string, options?: Parameters<typeof generateBarcodeSVG>[1]) {
+  try {
+    return generateBarcodeSVG(value, options);
+  } catch {
+    return "";
+  }
+}
 
 type Product = {
   id: string;
@@ -787,6 +804,8 @@ function POS() {
   const [fabricProduct, setFabricProduct] = useState<Product | null>(null);
   const [paymentOpen, setPaymentOpen] = useState(false);
   const [orderWidth, setOrderWidth] = useState(390);
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const barcodeInputRef = useRef<HTMLInputElement | null>(null);
   const categories = ["All", "Apparel", "Footwear", "Accessories", "Groceries", "Electronics"];
   const filtered = products.filter((p) => (category === "All" || p.category === category) && `${p.name} ${p.sku} ${p.barcode ?? ""}`.toLowerCase().includes(search.toLowerCase()));
   const totals = order.reduce((acc, line) => {
@@ -829,7 +848,25 @@ function POS() {
 
   function scanBarcode(event: React.FormEvent) {
     event.preventDefault();
+    if (isMobileBrowser()) {
+      setScannerOpen(true);
+      return;
+    }
     addScannedBarcode(barcode);
+  }
+
+  function handleScannerCode(value: string) {
+    const normalized = normalizeBarcode(value);
+    const product = products.find((item) => [item.sku, item.barcode].some((code) => code && normalizeBarcode(code) === normalized));
+    setScannerOpen(false);
+    if (product) {
+      addProduct(product, "scan");
+      showToast(`✓ ${product.name} added`);
+      window.setTimeout(() => setScannerOpen(true), 2000);
+      return;
+    }
+    showToast("Barcode not found — add product to inventory first");
+    window.setTimeout(() => setScannerOpen(true), 2000);
   }
 
   useEffect(() => {
@@ -890,7 +927,7 @@ function POS() {
           <h1>Point of Sale</h1>
           <label className="searchbox"><Search size={17} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products or SKU..." /></label>
         </div>
-        <form className="scanbox" onSubmit={scanBarcode}><ScanBarcode size={18} /><input value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode / SKU to add directly" /><button type="submit">Scan</button></form>
+        <form className="scanbox" onSubmit={scanBarcode}><ScanBarcode size={18} /><input ref={barcodeInputRef} value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode / SKU to add directly" /><button type="submit">Scan</button></form>
         <div className="category-row"><button className="arrow-btn"><ChevronLeft size={16} /></button>{categories.map((c) => <button key={c} className={`chip ${category === c ? "active" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}<button className="arrow-btn"><ChevronRight size={16} /></button></div>
         <div className="product-grid">
           {filtered.map((product) => (
@@ -914,7 +951,130 @@ function POS() {
       </aside>
       {fabricProduct && <FabricModal product={fabricProduct} onClose={() => setFabricProduct(null)} />}
       {paymentOpen && <PaymentModal total={totals.total} onClose={() => setPaymentOpen(false)} onConfirm={completePayment} />}
+      <BarcodeScannerModal visible={scannerOpen} onClose={() => setScannerOpen(false)} onManual={() => { setScannerOpen(false); barcodeInputRef.current?.focus(); }} onScanned={handleScannerCode} />
     </section>
+  );
+}
+
+function BarcodeScannerModal({ visible, onClose, onManual, onScanned }: { visible: boolean; onClose: () => void; onManual?: () => void; onScanned: (value: string) => void }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const controlsRef = useRef<{ stop: () => void } | null>(null);
+  const scannedRef = useRef(false);
+  const [message, setMessage] = useState("Starting camera...");
+  const [torchOn, setTorchOn] = useState(false);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    let cancelled = false;
+
+    const stopCamera = () => {
+      if (frameRef.current) window.cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    };
+
+    const handleCode = (value: string) => {
+      if (scannedRef.current) return;
+      scannedRef.current = true;
+      navigator.vibrate?.(100);
+      stopCamera();
+      onScanned(value);
+    };
+
+    async function start() {
+      scannedRef.current = false;
+      const permitted = await requestCameraPermission();
+      if (!permitted || cancelled) {
+        setMessage("Camera permission is needed to scan barcodes.");
+        return;
+      }
+
+      const method = getScannerMethod();
+      if (method === "unsupported") {
+        setMessage("Camera barcode scanning is not supported in this browser.");
+        return;
+      }
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        streamRef.current = stream;
+        video.srcObject = stream;
+        await video.play();
+        setMessage("Point at barcode");
+
+        if (method === "barcode-detector") {
+          const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+          if (!Detector) return;
+          const detector = new Detector({ formats: ["ean_13", "ean_8", "code_128", "code_39", "qr_code", "upc_a", "upc_e"] });
+          const detect = async () => {
+            if (cancelled || scannedRef.current || !videoRef.current) return;
+            try {
+              const barcodes = await detector.detect(videoRef.current);
+              if (barcodes[0]?.rawValue) {
+                handleCode(barcodes[0].rawValue);
+                return;
+              }
+            } catch {
+              // Keep scanning; mobile browsers can throw while video warms up.
+            }
+            frameRef.current = window.requestAnimationFrame(detect);
+          };
+          frameRef.current = window.requestAnimationFrame(detect);
+          return;
+        }
+
+        const reader = new BrowserMultiFormatReader();
+        controlsRef.current = await reader.decodeFromVideoElement(video, (result) => {
+          const value = result?.getText();
+          if (value) handleCode(value);
+        });
+      } catch {
+        setMessage("Unable to start camera. Use manual entry.");
+      }
+    }
+
+    start();
+    return () => {
+      cancelled = true;
+      stopCamera();
+    };
+  }, [visible, onScanned]);
+
+  async function toggleTorch() {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    const capabilities = track.getCapabilities() as MediaTrackCapabilities & { torch?: boolean };
+    if (!capabilities.torch) {
+      setMessage("Torch is not supported on this device.");
+      return;
+    }
+    await track.applyConstraints({ advanced: [{ torch: !torchOn } as MediaTrackConstraintSet] });
+    setTorchOn((value) => !value);
+  }
+
+  if (!visible) return null;
+  return createPortal(
+    <div className="scanner-modal">
+      <video className="scanner-video" ref={videoRef} muted playsInline />
+      <div className="scanner-topbar"><button onClick={onClose}>←</button><strong>Scan Barcode</strong><button onClick={toggleTorch}>{torchOn ? "Flash On" : "Flash"}</button></div>
+      <div className="scanner-window"><span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" /><span className="scan-line" /></div>
+      <div className="scanner-bottom"><p>{message}</p><button onClick={onManual ?? onClose}>Enter manually</button></div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1342,19 +1502,26 @@ function Inventory() {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<Product | null>(null);
   const [open, setOpen] = useState(false);
+  const [barcodePreview, setBarcodePreview] = useState<Product | null>(null);
+  const [printProducts, setPrintProducts] = useState<Product[] | null>(null);
+  const [bulkMode, setBulkMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const rows = products.filter((p) => `${p.name} ${p.sku}`.toLowerCase().includes(query.toLowerCase()));
+  const selectedProducts = products.filter((product) => selectedIds.includes(product.id));
   return (
     <section className="page">
-      <PageHeader title="Inventory" subtitle="Manage your products and stock levels." action={<button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Product</button>} />
+      <PageHeader title="Inventory" subtitle="Manage your products and stock levels." action={<div className="toolbar-actions">{bulkMode ? <><button className="outline" onClick={() => { setBulkMode(false); setSelectedIds([]); }}>Cancel</button><button className="primary" disabled={!selectedIds.length} onClick={() => setPrintProducts(selectedProducts)}>{selectedIds.length} selected · Print Labels</button></> : <><button className="outline" onClick={() => setBulkMode(true)}>Print Labels</button><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Product</button></>}</div>} />
       <label className="searchbox top-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search inventory..." /></label>
-      <DataTable headers={["Product Name", "SKU", "Category", "Unit", "Price", "GST", "Stock", "Actions"]}>
-        {rows.map((p) => <tr key={p.id}><td><strong>{p.name}</strong></td><td className="linkish">{p.sku}</td><td>{p.category}</td><td>{unitLabel(p.unitType)}</td><td>{INR.format(p.price)}</td><td><GSTPill rate={p.gstRate} /></td><td><span className={`stock-pill ${p.stock <= 10 ? "low" : ""}`}>{p.stock}</span></td><td className="actions"><button onClick={() => { setEditing(p); setOpen(true); }}><Edit size={16} /></button><button onClick={() => setProducts((items) => items.filter((item) => item.id !== p.id))}><Trash2 size={16} /></button></td></tr>)}
+      <DataTable headers={[...(bulkMode ? ["Select"] : []), "Product Name", "SKU", "Category", "Unit", "Price", "GST", "Stock", "Actions"]}>
+        {rows.map((p) => <tr key={p.id}>{bulkMode ? <td><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, p.id] : ids.filter((id) => id !== p.id))} /></td> : null}<td><strong>{p.name}</strong>{p.barcode ? <button className="barcode-mini" title="View barcode" onClick={() => setBarcodePreview(p)}><ScanBarcode size={15} /></button> : null}</td><td className="linkish">{p.sku}</td><td>{p.category}</td><td>{unitLabel(p.unitType)}</td><td>{INR.format(p.price)}</td><td><GSTPill rate={p.gstRate} /></td><td><span className={`stock-pill ${p.stock <= 10 ? "low" : ""}`}>{p.stock}</span></td><td className="actions"><button onClick={() => { setEditing(p); setOpen(true); }}><Edit size={16} /></button><button onClick={() => setPrintProducts([p])} title="Print labels"><ScanBarcode size={16} /></button><button onClick={() => setProducts((items) => items.filter((item) => item.id !== p.id))}><Trash2 size={16} /></button></td></tr>)}
       </DataTable>
       {open && <ProductModal product={editing} onClose={() => setOpen(false)} onSave={(product) => {
         setProducts((items) => editing ? items.map((item) => item.id === editing.id ? product : item) : [...items, product]);
         showToast(editing ? "Product updated" : "Product created");
         setOpen(false);
       }} />}
+      {barcodePreview && <BarcodePreviewModal product={barcodePreview} onClose={() => setBarcodePreview(null)} onPrint={() => setPrintProducts(barcodePreview ? [barcodePreview] : null)} onCopied={() => showToast("Copied!")} />}
+      {printProducts && <PrintLabelsModal products={printProducts} onClose={() => setPrintProducts(null)} />}
     </section>
   );
 }
@@ -1362,17 +1529,52 @@ function Inventory() {
 function ProductModal({ product, onClose, onSave }: { product: Product | null; onClose: () => void; onSave: (product: Product) => void }) {
   const [form, setForm] = useState<Product>(product ?? { id: crypto.randomUUID(), name: "", sku: "", category: "", gstRate: 0, price: 0, stock: 0, unitType: "piece", barcode: "" });
   const [gstEnabled, setGstEnabled] = useState(form.gstRate > 0);
+  const [scannerOpen, setScannerOpen] = useState(false);
   const required = form.name && form.category && form.price > 0 && form.stock >= 0 && form.unitType;
   const update = <K extends keyof Product>(key: K, value: Product[K]) => setForm((draft) => ({ ...draft, [key]: value }));
+  const barcodeValue = form.barcode?.trim() ?? "";
+  const barcodePreview = barcodeValue.length >= 8 ? safeBarcodeSVG(barcodeValue) : "";
   return (
     <Modal onClose={onClose} className="product-modal">
       <div className="modal-head"><h2>{product ? "Edit Product" : "Add New Product"}</h2><button onClick={onClose}><X size={20} /></button></div>
       <div className="form-grid two"><TextField label="Product Name" value={form.name} onChange={(v) => update("name", v)} placeholder="e.g. Cotton T-Shirt" /><TextField label="Category" value={form.category} onChange={(v) => update("category", v)} placeholder="e.g. Apparel" /></div>
       <div className="form-grid three"><TextField label="Price (₹)" type="number" value={String(form.price)} onChange={(v) => update("price", Number(v))} /><TextField label="Stock Level" type="number" value={String(form.stock)} onChange={(v) => update("stock", Number(v))} /><label className="field"><span>Unit Type</span><select value={form.unitType} onChange={(e) => update("unitType", e.target.value as UnitType)}><option value="piece">Piece (Integer)</option><option value="kg">Kg (Decimal)</option><option value="meter">Meter (Decimal)</option><option value="liter">Liter (Decimal)</option></select>{form.unitType === "meter" && <small>ℹ Fabric Quantity Modal will appear at POS checkout</small>}</label></div>
-      <div className="form-grid two"><TextField label="SKU" value={form.sku} onChange={(v) => update("sku", v)} placeholder="e.g. TS-001" /><TextField label="Barcode" value={form.barcode ?? ""} onChange={(v) => update("barcode", v)} placeholder="Scan or enter" /></div>
+      <div className="form-grid two"><TextField label="SKU" value={form.sku} onChange={(v) => update("sku", v)} placeholder="e.g. TS-001" /><label className="field"><span>Barcode</span><div className="barcode-field-row"><input className="mono-input" value={form.barcode ?? ""} onChange={(event) => update("barcode", event.target.value)} placeholder="EAN-13 or Code128" /><button className="outline" type="button" onClick={() => update("barcode", generateEAN13())}>Generate</button>{isMobileBrowser() ? <button className="outline" type="button" onClick={() => setScannerOpen(true)}>Scan</button> : null}</div><small>EAN-13 or Code128 — leave blank to generate.</small></label></div>
+      {barcodePreview ? <div className="barcode-preview" dangerouslySetInnerHTML={{ __html: barcodePreview }} /> : null}
       <div className="toggle-row"><strong>Enable GST Tax</strong><button className={`switch ${gstEnabled ? "on" : ""}`} onClick={() => { setGstEnabled(!gstEnabled); update("gstRate", !gstEnabled ? 5 : 0); }}><span /></button></div>
       {gstEnabled && <label className="field"><span>GST Rate (%)</span><select value={form.gstRate} onChange={(e) => update("gstRate", Number(e.target.value))}><option value={0}>0%</option><option value={5}>5%</option><option value={12}>12%</option><option value={18}>18%</option><option value={28}>28%</option></select></label>}
       <div className="modal-actions end"><button className="primary" disabled={!required} onClick={() => required && onSave(form)}>{product ? "Update Product" : "Create Product"}</button></div>
+      <BarcodeScannerModal visible={scannerOpen} onClose={() => setScannerOpen(false)} onScanned={(value) => { update("barcode", value); setScannerOpen(false); }} />
+    </Modal>
+  );
+}
+
+function BarcodePreviewModal({ product, onClose, onPrint, onCopied }: { product: Product; onClose: () => void; onPrint: () => void; onCopied: () => void }) {
+  const value = product.barcode || product.sku;
+  const svg = safeBarcodeSVG(value, { height: 100, width: 2.5 });
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><div><h2>{product.name}</h2><p>Product Barcode</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="barcode-large" dangerouslySetInnerHTML={{ __html: svg }} />
+      <code className="barcode-number">{value}</code>
+      <p className="muted">SKU: {product.sku}</p>
+      <div className="modal-actions"><button className="primary" onClick={onPrint}>Print Labels</button><button className="outline" onClick={async () => { await navigator.clipboard?.writeText(value); onCopied(); }}>Copy</button></div>
+    </Modal>
+  );
+}
+
+function PrintLabelsModal({ products, onClose }: { products: Product[]; onClose: () => void }) {
+  const [copies, setCopies] = useState(1);
+  const [size, setSize] = useState<LabelSize>("medium");
+  const first = products[0];
+  const previewSvg = first ? safeBarcodeSVG(first.barcode || first.sku, { height: size === "large" ? 55 : size === "small" ? 30 : 40, fontSize: 8 }) : "";
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><div><h2>Print Barcode Labels</h2><p>{products.length === 1 ? products[0].name : `${products.length} products selected`}</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="label-control-row"><span>Copies per product</span><div className="mini-stepper"><button onClick={() => setCopies((value) => Math.max(1, value - 1))}>−</button><strong>{copies}</strong><button onClick={() => setCopies((value) => Math.min(200, value + 1))}>+</button></div></div>
+      <div className="label-size-row">{(["small", "medium", "large"] as LabelSize[]).map((item) => <button key={item} className={`chip ${size === item ? "active" : ""}`} onClick={() => setSize(item)}>{item[0].toUpperCase() + item.slice(1)}</button>)}</div>
+      {first ? <div className="label-preview"><strong>{first.name}</strong><div dangerouslySetInnerHTML={{ __html: previewSvg }} /><span>{INR.format(first.price)} · {first.sku}</span></div> : null}
+      <div className="modal-actions"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" onClick={() => printLabels(products.map((product) => ({ product, copies, size })))}>Print</button></div>
     </Modal>
   );
 }

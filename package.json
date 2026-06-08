@@ -12,7 +12,10 @@
   "dependencies": {
     "@expo/metro-runtime": "^6.1.2",
     "@expo/vector-icons": "^15.0.2",
+    "@zxing/browser": "^0.2.0",
+    "@zxing/library": "^0.22.0",
     "expo": "~54.0.25",
+    "jsbarcode": "^3.12.3",
     "lucide-react": "^0.468.0",
     "react": "19.1.0",
     "react-dom": "19.1.0",
@@ -23,6 +26,7 @@
     "tailwindcss": "^4.1.17"
   },
   "devDependencies": {
+    "@types/jsbarcode": "^3.11.4",
     "@types/react": "~19.1.10",
     "typescript": "~5.9.2"
   }
