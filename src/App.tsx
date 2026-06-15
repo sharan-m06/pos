@@ -13,15 +13,18 @@ import {
   AlertTriangle,
   BarChart3,
   Box,
-  ChevronDown,
+  CalendarDays,
   ChevronLeft,
   ChevronRight,
   Check,
+  ClipboardList,
+  Download,
   Edit,
   Eye,
   IndianRupee,
   Lock,
   LogOut,
+  List,
   Mail,
   PackagePlus,
   Pencil,
@@ -33,6 +36,8 @@ import {
   ShoppingCart,
   Store,
   Trash2,
+  TrendingUp,
+  Truck,
   User,
   Users,
   X,
@@ -42,6 +47,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -51,6 +57,11 @@ import { generateBarcodeSVG } from "./utils/barcodeGenerator";
 import { getScannerMethod, isMobileBrowser } from "./utils/barcodeScanner";
 import { generateUniqueBarcode, generateUniqueSKU, isBarcodeUnique, isSKUUnique, isValidEAN13, migrateProductCodes } from "./utils/generateProductCodes";
 import { LabelSize, printLabels } from "./utils/printLabels";
+import { TimeInput } from "./components/ui/TimeInput";
+import type { Supplier } from "./types/supplier";
+import type { POItem, POStatus, PurchaseOrder } from "./types/purchaseOrder";
+import type { ExpenseCategory, PaymentMode } from "./types/expense";
+import { computePnLFromData } from "./utils/computePnL";
 
 type UnitType = "piece" | "kg" | "meter" | "liter";
 type StaffRole = "Owner" | "Manager" | "Salesperson" | "Cashier";
@@ -75,7 +86,10 @@ type Product = {
   category: string;
   gstRate: number;
   price: number;
+  mrp?: number;
+  description?: string;
   stock: number;
+  costPrice?: number;
   unitType: UnitType;
   barcode: string;
 };
@@ -144,10 +158,16 @@ type PaymentMethod = "Card" | "Cash" | "QR Code";
 type Expense = {
   id: string;
   date: string;
-  category: string;
-  vendor: string;
+  category: ExpenseCategory;
+  description: string;
+  vendor?: string;
   amount: number;
   payment: string;
+  paymentMode: PaymentMode;
+  receiptNo?: string;
+  notes?: string;
+  createdBy: string;
+  createdAt: string;
 };
 
 type AuditEvent = {
@@ -240,11 +260,56 @@ const seedInvoices: Invoice[] = [
 ];
 
 const seedExpenses: Expense[] = [
-  { id: "EXP-001", date: "Jun 5, 2026 9:10 AM", category: "Inventory", vendor: "Supplier Hub", amount: 420, payment: "Bank" },
-  { id: "EXP-002", date: "Jun 5, 2026 2:20 PM", category: "Utilities", vendor: "Power Board", amount: 72.5, payment: "Cash" },
-  { id: "EXP-003", date: "Jun 3, 2026 11:05 AM", category: "Packaging", vendor: "CarryBag Co", amount: 118.75, payment: "UPI" },
-  { id: "EXP-004", date: "May 30, 2026 4:45 PM", category: "Maintenance", vendor: "POS Service", amount: 95, payment: "Card" },
+  { id: "EXP-0001", date: offsetDate(0, 9, 10), category: "inventory", description: "Emergency stock purchase", vendor: "Supplier Hub", amount: 420, payment: "Bank", paymentMode: "bank_transfer", receiptNo: "R-1021", createdBy: "Admin Owner", createdAt: offsetDate(0, 9, 10) },
+  { id: "EXP-0002", date: offsetDate(0, 14, 20), category: "utilities", description: "Electricity and internet", vendor: "Power Board", amount: 72.5, payment: "Cash", paymentMode: "cash", receiptNo: "EB-909", createdBy: "Admin Owner", createdAt: offsetDate(0, 14, 20) },
+  { id: "EXP-0003", date: offsetDate(-2, 11, 5), category: "marketing", description: "Festival banner printing", vendor: "CarryBag Co", amount: 118.75, payment: "UPI", paymentMode: "upi", createdBy: "Store Manager", createdAt: offsetDate(-2, 11, 5) },
+  { id: "EXP-0004", date: offsetDate(-7, 16, 45), category: "maintenance", description: "POS terminal service", vendor: "POS Service", amount: 95, payment: "Card", paymentMode: "card", createdBy: "Admin Owner", createdAt: offsetDate(-7, 16, 45) },
 ];
+
+const seedSuppliers: Supplier[] = [
+  { id: "sup-1", name: "Northstar Textiles", contactPerson: "Ravi Mehta", phone: "98765 43210", email: "ravi@northstar.example", address: "Peenya Industrial Area, Bengaluru", gstin: "29ABCDE1234F1Z5", paymentTerms: "Net 15", notes: "Primary apparel supplier", createdAt: new Date().toISOString(), isActive: true },
+  { id: "sup-2", name: "Metro Footwear Supply", contactPerson: "Nisha Rao", phone: "98450 11223", email: "orders@metrofoot.example", address: "K R Market, Bengaluru", gstin: "29PQRSX6789L1Z2", paymentTerms: "Net 7", notes: "Shoes and accessories", createdAt: new Date().toISOString(), isActive: true },
+  { id: "sup-3", name: "Fresh Basket Wholesale", contactPerson: "Amit Shah", phone: "99001 77889", email: "sales@freshbasket.example", address: "Yeshwanthpur APMC Yard", gstin: "29LMNOP2468Q1Z8", paymentTerms: "Immediate", notes: "Groceries and oils", createdAt: new Date().toISOString(), isActive: true },
+];
+
+function buildPOItem(product: Product, orderedQty: number, receivedQty: number, unitCost: number): POItem {
+  const taxable = orderedQty * unitCost;
+  const gst = taxable * (product.gstRate / 100);
+  return {
+    id: crypto.randomUUID(),
+    productId: product.id,
+    productName: product.name,
+    sku: product.sku,
+    orderedQty,
+    receivedQty,
+    unitCost,
+    gstRate: product.gstRate,
+    cgst: gst / 2,
+    sgst: gst / 2,
+    igst: 0,
+    lineTotal: taxable + gst,
+  };
+}
+
+function totalsForPO(items: POItem[]) {
+  const subtotal = items.reduce((sum, item) => sum + item.orderedQty * item.unitCost, 0);
+  const totalCGST = items.reduce((sum, item) => sum + item.cgst, 0);
+  const totalSGST = items.reduce((sum, item) => sum + item.sgst, 0);
+  const totalIGST = items.reduce((sum, item) => sum + item.igst, 0);
+  const totalGST = totalCGST + totalSGST + totalIGST;
+  return { subtotal, totalCGST, totalSGST, totalIGST, totalGST, grandTotal: subtotal + totalGST };
+}
+
+const seedPurchaseOrders: PurchaseOrder[] = (() => {
+  const firstItems = [buildPOItem(seedProducts[0], 30, 30, 18), buildPOItem(seedProducts[1], 20, 12, 38)];
+  const secondItems = [buildPOItem(seedProducts[2], 12, 0, 66), buildPOItem(seedProducts[4], 10, 0, 92)];
+  const firstTotals = totalsForPO(firstItems);
+  const secondTotals = totalsForPO(secondItems);
+  return [
+    { id: "PO-0001", supplierId: seedSuppliers[0].id, supplierName: seedSuppliers[0].name, supplierGSTIN: seedSuppliers[0].gstin, status: "partial", items: firstItems, ...firstTotals, orderDate: offsetDate(-4, 10, 0), expectedDate: dateKey(new Date().toISOString()), notes: "Partial shipment received", createdBy: "Admin Owner", createdAt: offsetDate(-4, 10, 0), updatedAt: offsetDate(-1, 15, 0) },
+    { id: "PO-0002", supplierId: seedSuppliers[1].id, supplierName: seedSuppliers[1].name, supplierGSTIN: seedSuppliers[1].gstin, status: "sent", items: secondItems, ...secondTotals, orderDate: offsetDate(-1, 12, 0), expectedDate: dateKey(new Date(Date.now() + 2 * 86400000).toISOString()), notes: "Urgent replenishment", createdBy: "Store Manager", createdAt: offsetDate(-1, 12, 0), updatedAt: offsetDate(-1, 12, 0) },
+  ];
+})();
 
 const seedAuditEvents: AuditEvent[] = [
   { id: "AUD-001", time: "Jun 5, 2026 12:15 PM", user: "Admin Owner", area: "Sales", action: "Created invoice and printed bill", severity: "Info" },
@@ -272,6 +337,10 @@ type AppState = {
   setInvoices: React.Dispatch<React.SetStateAction<Invoice[]>>;
   expenses: Expense[];
   setExpenses: React.Dispatch<React.SetStateAction<Expense[]>>;
+  suppliers: Supplier[];
+  setSuppliers: React.Dispatch<React.SetStateAction<Supplier[]>>;
+  purchaseOrders: PurchaseOrder[];
+  setPurchaseOrders: React.Dispatch<React.SetStateAction<PurchaseOrder[]>>;
   customers: Customer[];
   staff: Staff[];
   setStaff: React.Dispatch<React.SetStateAction<Staff[]>>;
@@ -476,6 +545,19 @@ function hoursBetween(checkIn?: string, checkOut?: string) {
   return diff >= 0 ? Number(diff.toFixed(2)) : undefined;
 }
 
+function hoursLabel(checkIn?: string, checkOut?: string) {
+  const hours = hoursBetween(checkIn, checkOut);
+  if (!checkIn || !checkOut) return "";
+  return hours === undefined ? "Invalid" : `${hours} hrs`;
+}
+
+function amPm(time?: string) {
+  if (!time) return "";
+  const hour = Number(time.split(":")[0]);
+  if (Number.isNaN(hour)) return "";
+  return hour < 12 ? "AM" : "PM";
+}
+
 function statusLabel(status: AttendanceStatus) {
   return status === "half-day" ? "Half Day" : status === "late" ? "Late" : status === "leave" ? "Leave" : status === "absent" ? "Absent" : "Present";
 }
@@ -616,6 +698,9 @@ function roleAccess(role: StaffRole) {
     canDeleteInvoice: role === "Owner",
     canExportSales: role === "Owner" || role === "Manager",
     canManageInventory: role === "Owner" || role === "Manager",
+    canManageProcurement: role === "Owner" || role === "Manager",
+    canViewExpenses: role === "Owner" || role === "Manager",
+    canViewPnL: role === "Owner",
     canViewReports: role === "Owner" || role === "Manager",
     canViewPerformance: role === "Owner",
     canManageStaff: role === "Owner",
@@ -626,6 +711,8 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   const [products, setProducts] = useState(seedProducts);
   const [invoices, setInvoices] = useState(seedInvoices);
   const [expenses, setExpenses] = useState(seedExpenses);
+  const [suppliers, setSuppliers] = useState(seedSuppliers);
+  const [purchaseOrders, setPurchaseOrders] = useState(seedPurchaseOrders);
   const [staff, setStaff] = useState(seedStaff);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [order, setOrder] = useState<OrderLine[]>([]);
@@ -636,8 +723,8 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const value = useMemo(
-    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, customers: seedCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, toast, showToast }),
-    [products, invoices, expenses, staff, attendance, order, toast],
+    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, customers: seedCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, toast, showToast }),
+    [products, invoices, expenses, suppliers, purchaseOrders, staff, attendance, order, toast],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -763,31 +850,47 @@ function LabeledInput({ icon, value, onChange, placeholder, type = "text" }: { i
 function Shell({ onSignOut }: { onSignOut: () => void }) {
   const { toast, staff } = useApp();
   const location = useLocation();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => (typeof localStorage !== "undefined" ? localStorage.getItem("sidebarCollapsed") === "true" : false));
   const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
   const access = roleAccess(currentUser.role);
   const navItems = [
-    { path: "/dashboard", label: "Dashboard", icon: <BarChart3 size={18} />, allowed: true },
-    { path: "/pos", label: "Point of Sale", icon: <ShoppingCart size={18} />, allowed: access.canUsePos },
-    { path: "/sales", label: "Sales History", icon: <IndianRupee size={18} />, allowed: access.canViewSales },
-    { path: "/products", label: "Inventory", icon: <Box size={18} />, allowed: access.canManageInventory },
-    { path: "/customers", label: "Customers", icon: <Users size={18} />, allowed: true },
-    { path: "/reports", label: "Reports", icon: <BarChart3 size={18} />, allowed: access.canViewReports },
-    { path: "/performance", label: "Performance", icon: <BarChart3 size={18} />, allowed: access.canViewPerformance },
-    { path: "/staff", label: "Staff", icon: <User size={18} />, allowed: access.canManageStaff },
+    { path: "/dashboard", label: "Dashboard", icon: <BarChart3 size={17} />, allowed: true },
+    { path: "/pos", label: "Point of Sale", icon: <ShoppingCart size={17} />, allowed: access.canUsePos },
+    { path: "/sales", label: "Sales History", icon: <IndianRupee size={17} />, allowed: access.canViewSales },
+    { path: "/products", label: "Inventory", icon: <Box size={17} />, allowed: access.canManageInventory },
+    { path: "/suppliers", label: "Suppliers", icon: <Truck size={17} />, allowed: access.canManageProcurement },
+    { path: "/purchase-orders", label: "Purchase Orders", icon: <ClipboardList size={17} />, allowed: access.canManageProcurement },
+    { path: "/customers", label: "Customers", icon: <Users size={17} />, allowed: true },
+    { path: "/reports", label: "Reports", icon: <BarChart3 size={17} />, allowed: access.canViewReports },
+    { path: "/expenses", label: "Expenses", icon: <IndianRupee size={17} />, allowed: access.canViewExpenses },
+    { path: "/reports/pnl", label: "P&L Report", icon: <TrendingUp size={17} />, allowed: access.canViewPnL },
+    { path: "/performance", label: "Performance", icon: <BarChart3 size={17} />, allowed: access.canViewPerformance },
+    { path: "/staff", label: "Staff", icon: <User size={17} />, allowed: access.canManageStaff },
   ];
 
+  useEffect(() => {
+    const width = sidebarCollapsed ? "64px" : "268px";
+    document.documentElement.style.setProperty("--sidebar-width", width);
+    localStorage.setItem("sidebarCollapsed", String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
-        <div className="store-head"><div className="brand-mark"><Store size={22} /></div><strong>Retail Demo Store</strong></div>
+        <div className="store-head">
+          <button className="store-brand-toggle" type="button" title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setSidebarCollapsed((value) => !value)}>
+            <div className="brand-mark"><Store size={22} /></div>
+            {!sidebarCollapsed ? <strong>Retail Demo Store</strong> : null}
+          </button>
+        </div>
         <nav>
           {navItems.filter((item) => item.allowed).map((item) => (
-            <NavLink key={item.path} className={({ isActive }) => `nav-row ${isActive ? "active" : ""}`} to={item.path}>{item.icon}<span>{item.label}</span></NavLink>
+            <NavLink key={item.path} end={item.path === "/reports"} title={sidebarCollapsed ? item.label : undefined} className={({ isActive }) => `nav-row ${isActive ? "active" : ""}`} to={item.path}>{item.icon}{!sidebarCollapsed ? <span>{item.label}</span> : null}</NavLink>
           ))}
         </nav>
         <div className="sidebar-user">
           <div className="avatar">{currentUser.name[0]}</div>
-          <div><strong>{currentUser.name}</strong><span>{currentUser.role}</span></div>
+          {!sidebarCollapsed ? <div><strong>{currentUser.name}</strong><span>{currentUser.role}</span></div> : null}
         </div>
         <button
           className="signout"
@@ -795,17 +898,22 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
             localStorage.removeItem("retailflow-auth");
             onSignOut();
           }}
-        ><LogOut size={17} />Sign Out</button>
+          title={sidebarCollapsed ? "Sign Out" : undefined}
+        ><LogOut size={17} />{!sidebarCollapsed ? <span>Sign Out</span> : null}</button>
       </aside>
-      <main className="content">
+      <main className={`content ${location.pathname === "/pos" ? "pos-screen" : ""}`}>
         {location.pathname === "/" ? <Navigate to="/dashboard" replace /> : (
           <Routes>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/pos" element={access.canUsePos ? <POS /> : <Navigate to="/dashboard" replace />} />
             <Route path="/sales" element={access.canViewSales ? <Sales /> : <Navigate to="/dashboard" replace />} />
             <Route path="/products" element={access.canManageInventory ? <Inventory /> : <Navigate to="/dashboard" replace />} />
+            <Route path="/suppliers" element={access.canManageProcurement ? <SuppliersScreen /> : <Navigate to="/dashboard" replace />} />
+            <Route path="/purchase-orders" element={access.canManageProcurement ? <PurchaseOrdersScreen /> : <Navigate to="/dashboard" replace />} />
             <Route path="/customers" element={<Customers />} />
             <Route path="/reports" element={access.canViewReports ? <Reports /> : <Navigate to="/dashboard" replace />} />
+            <Route path="/expenses" element={access.canViewExpenses ? <ExpensesScreen /> : <Navigate to="/dashboard" replace />} />
+            <Route path="/reports/pnl" element={access.canViewPnL ? <PnLScreen /> : <Navigate to="/dashboard" replace />} />
             <Route path="/performance" element={access.canViewPerformance ? <Performance /> : <Navigate to="/dashboard" replace />} />
             <Route path="/staff" element={access.canManageStaff ? <StaffPage /> : <Navigate to="/dashboard" replace />} />
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
@@ -852,30 +960,40 @@ function Dashboard() {
   );
 }
 
-function RevenueChart({ data, xKey, height = 300 }: { data: Array<Record<string, string | number>>; xKey: string; height?: number }) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState(0);
+function useIsMobileViewport(breakpoint = 480) {
+  const [isMobile, setIsMobile] = useState(() => (typeof window !== "undefined" ? window.innerWidth < breakpoint : false));
 
   useEffect(() => {
-    if (!ref.current) return undefined;
-    const observer = new ResizeObserver(([entry]) => {
-      setWidth(Math.max(0, Math.floor(entry.contentRect.width)));
-    });
-    observer.observe(ref.current);
-    return () => observer.disconnect();
-  }, []);
+    if (typeof window === "undefined") return undefined;
+    const handleResize = () => setIsMobile(window.innerWidth < breakpoint);
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [breakpoint]);
+
+  return isMobile;
+}
+
+function chartYAxis(value: number, isMobile: boolean) {
+  if (isMobile && value >= 1000) return `₹${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)}k`;
+  return `₹${value.toLocaleString("en-IN")}`;
+}
+
+function RevenueChart({ data, xKey, height = 300 }: { data: Array<Record<string, string | number>>; xKey: string; height?: number }) {
+  const isMobile = useIsMobileViewport();
+  const chartHeight = isMobile ? 220 : height;
 
   return (
-    <div className="chart-wrap" ref={ref}>
-      {width > 0 ? (
-        <BarChart width={width} height={height} data={data} margin={{ top: 12, right: 12, left: 8, bottom: 0 }}>
+    <div className="chart-wrap" style={{ height: chartHeight, minHeight: chartHeight }}>
+      <ResponsiveContainer width="100%" height={chartHeight}>
+        <BarChart data={data} barCategoryGap="8%" barGap={0} margin={{ top: 12, right: 12, left: isMobile ? -10 : 8, bottom: 0 }}>
           <CartesianGrid vertical={false} stroke="#E5E7EB" />
           <XAxis dataKey={xKey} tickLine={false} axisLine={false} />
-          <YAxis tickFormatter={(v) => `₹${v.toLocaleString("en-IN")}`} domain={[0, "dataMax + 100"]} tickLine={false} axisLine={false} />
+          <YAxis tickFormatter={(v) => chartYAxis(Number(v), isMobile)} domain={[0, "dataMax + 100"]} tickLine={false} axisLine={false} />
           <Tooltip formatter={(v) => INR.format(Number(v))} />
-          <Bar dataKey="revenue" fill="#2563EB" radius={[8, 8, 0, 0]} />
+          <Bar dataKey="revenue" fill="#2563EB" radius={[8, 8, 0, 0]} maxBarSize={72} minPointSize={4} />
         </BarChart>
-      ) : null}
+      </ResponsiveContainer>
     </div>
   );
 }
@@ -1043,7 +1161,7 @@ function POS() {
     const startWidth = orderWidth;
     const onMove = (moveEvent: MouseEvent) => {
       const nextWidth = startWidth + (startX - moveEvent.clientX);
-      setOrderWidth(Math.min(540, Math.max(320, nextWidth)));
+      setOrderWidth(Math.min(520, Math.max(280, nextWidth)));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -1054,21 +1172,26 @@ function POS() {
   }
 
   return (
-    <section className="pos-layout" style={{ "--order-width": `${orderWidth}px` } as React.CSSProperties}>
+    <section className="page pos-page">
+      <div className="page-header">
+        <div>
+          <h1>Point of Sale</h1>
+        </div>
+      </div>
+      <div className="pos-layout" style={{ "--order-width": `${orderWidth}px` } as React.CSSProperties}>
       <div className="pos-products">
         <div className={`pos-sticky-header ${isProductGridScrolled ? "scrolled" : ""}`}>
-          <div className="pos-head">
-            <h1>Point of Sale</h1>
+          <div className="pos-head pos-control-row">
+            <div className="salesperson-row">
+              <label htmlFor="salesperson-select"><User size={16} /> Salesperson:</label>
+              <select id="salesperson-select" value={selectedSalespersonId} onChange={(event) => { setSelectedSalespersonId(event.target.value); setSalespersonTouched(true); }}>
+                <option value="">Select salesperson...</option>
+                {salespersonOptions.map((member) => <option key={member.id} value={member.id}>{member.name} · {member.role}</option>)}
+              </select>
+            </div>
             <label className="searchbox"><Search size={17} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products or SKU..." /></label>
           </div>
           <form className="scanbox" onSubmit={scanBarcode}><ScanBarcode size={18} /><input ref={barcodeInputRef} value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode / SKU to add directly" /><button type="submit">Scan</button></form>
-          <div className="salesperson-row">
-            <label htmlFor="salesperson-select"><User size={16} /> Salesperson:</label>
-            <select id="salesperson-select" value={selectedSalespersonId} onChange={(event) => { setSelectedSalespersonId(event.target.value); setSalespersonTouched(true); }}>
-              <option value="">Select salesperson...</option>
-              {salespersonOptions.map((member) => <option key={member.id} value={member.id}>{member.name} · {member.role}</option>)}
-            </select>
-          </div>
           {salespersonTouched && !selectedSalesperson ? <div className="salesperson-warning">Please select a salesperson to continue</div> : null}
           <div className="category-row"><button className="arrow-btn"><ChevronLeft size={16} /></button><div className="category-pills">{categories.map((c) => <button key={c} className={`chip ${category === c ? "active" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}</div><button className="arrow-btn"><ChevronRight size={16} /></button></div>
         </div>
@@ -1097,6 +1220,7 @@ function POS() {
       {fabricProduct && <FabricModal product={fabricProduct} onClose={() => setFabricProduct(null)} />}
       {paymentOpen && <PaymentModal total={totals.total} onClose={() => setPaymentOpen(false)} onConfirm={completePayment} />}
       <BarcodeScannerModal visible={scannerOpen} prewarmedStream={prewarmedStreamRef.current} onClose={() => { setScannerOpen(false); prewarmedStreamRef.current = null; }} onManual={() => { setScannerOpen(false); prewarmedStreamRef.current = null; barcodeInputRef.current?.focus(); }} onScanned={handleScannerCode} />
+      </div>
     </section>
   );
 }
@@ -1707,7 +1831,7 @@ function ProductModal({ product, onClose, onSave }: { product: Product | null; o
     const category = product?.category ?? "";
     return product ?? { id, name: "", sku: generateUniqueSKU(category || "GEN", products, id), category, gstRate: 0, price: 0, stock: 0, unitType: "piece", barcode: generateUniqueBarcode(products, id) };
   });
-  const [gstEnabled, setGstEnabled] = useState(form.gstRate > 0);
+  const [salesInfoEnabled, setSalesInfoEnabled] = useState(true);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [skuEdited, setSkuEdited] = useState(false);
   const [barcodeEdited, setBarcodeEdited] = useState(false);
@@ -1717,6 +1841,7 @@ function ProductModal({ product, onClose, onSave }: { product: Product | null; o
   const update = <K extends keyof Product>(key: K, value: Product[K]) => setForm((draft) => ({ ...draft, [key]: value }));
   const barcodeValue = form.barcode?.trim() ?? "";
   const barcodePreview = barcodeValue.length >= 8 ? safeBarcodeSVG(barcodeValue) : "";
+  const categoryOptions = Array.from(new Set(["Apparel", "Footwear", "Accessories", "Groceries", "Electronics", ...products.map((item) => item.category).filter(Boolean)]));
   const regenerateSKU = (category = form.category || "GEN") => {
     update("sku", generateUniqueSKU(category, products, form.id));
     setSkuEdited(false);
@@ -1762,15 +1887,25 @@ function ProductModal({ product, onClose, onSave }: { product: Product | null; o
   return (
     <Modal onClose={onClose} className="product-modal">
       <div className="modal-head"><h2>{product ? "Edit Product" : "Add New Product"}</h2><button onClick={onClose}><X size={20} /></button></div>
-      <div className="form-grid two"><TextField label="Product Name" value={form.name} onChange={(v) => update("name", v)} placeholder="e.g. Cotton T-Shirt" /><TextField label="Category" value={form.category} onChange={updateCategory} placeholder="e.g. Apparel" /></div>
-      <div className="form-grid three"><TextField label="Price (₹)" type="number" value={String(form.price)} onChange={(v) => update("price", Number(v))} /><TextField label="Stock Level" type="number" value={String(form.stock)} onChange={(v) => update("stock", Number(v))} /><label className="field"><span>Unit Type</span><select value={form.unitType} onChange={(e) => update("unitType", e.target.value as UnitType)}><option value="piece">Piece (Integer)</option><option value="kg">Kg (Decimal)</option><option value="meter">Meter (Decimal)</option><option value="liter">Liter (Decimal)</option></select>{form.unitType === "meter" && <small>ℹ Fabric Quantity Modal will appear at POS checkout</small>}</label></div>
-      <div className="form-grid two">
-        <label className="field"><span>SKU {skuEdited ? <em className="edited-note">Edited — verify uniqueness</em> : null}</span><div className="code-field-row"><input className="mono-input" value={form.sku} onChange={(event) => { setSkuEdited(true); update("sku", event.target.value.toUpperCase()); }} placeholder="APP-047823" /><button className="outline icon-only" type="button" title="Regenerate SKU" onClick={() => regenerateSKU()}>↻</button></div>{skuError ? <small className="field-error">{skuError}</small> : <small>Auto-generated from category and kept unique.</small>}</label>
-        <label className="field"><span>Barcode {barcodeEdited ? <em className="edited-note">Edited — verify uniqueness</em> : null}</span><div className="barcode-field-row"><input className="mono-input" value={form.barcode} onChange={(event) => { setBarcodeEdited(true); update("barcode", event.target.value.replace(/\D/g, "").slice(0, 13)); }} placeholder="8901234567890" /><button className="outline icon-only" type="button" title="Regenerate barcode" onClick={regenerateBarcode}>↻</button>{isMobileBrowser() ? <button className="outline" type="button" onClick={() => setScannerOpen(true)}>Scan</button> : null}</div>{barcodeError ? <small className="field-error">{barcodeError}</small> : <small>Unique EAN-13 barcode for printing and scanning.</small>}</label>
-      </div>
-      {barcodePreview ? <div className="barcode-preview" dangerouslySetInnerHTML={{ __html: barcodePreview }} /> : null}
-      <div className="toggle-row"><strong>Enable GST Tax</strong><button className={`switch ${gstEnabled ? "on" : ""}`} onClick={() => { setGstEnabled(!gstEnabled); update("gstRate", !gstEnabled ? 5 : 0); }}><span /></button></div>
-      {gstEnabled && <label className="field"><span>GST Rate (%)</span><select value={form.gstRate} onChange={(e) => update("gstRate", Number(e.target.value))}><option value={0}>0%</option><option value={5}>5%</option><option value={12}>12%</option><option value={18}>18%</option><option value={28}>28%</option></select></label>}
+      <section className="product-form-section">
+        <h3>Basic Info</h3>
+        <div className="product-form-grid">
+          <label className="field product-field-full"><span>Product Name</span><input value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="e.g. Cotton T-Shirt" /></label>
+          <label className="field"><span>Category</span><select value={form.category} onChange={(event) => updateCategory(event.target.value)}><option value="">Select category</option>{categoryOptions.map((category) => <option key={category} value={category}>{category}</option>)}</select></label>
+          <label className="field"><span>Unit Type</span><select value={form.unitType} onChange={(event) => update("unitType", event.target.value as UnitType)}><option value="piece">Piece</option><option value="kg">Kg</option><option value="meter">Metre</option><option value="liter">Litre</option></select>{form.unitType === "meter" && <small>Fabric quantity will be captured at checkout.</small>}</label>
+          <label className="field"><span>SKU {skuEdited ? <em className="edited-note">Edited</em> : null}</span><div className="code-field-row"><input className="mono-input" value={form.sku} onChange={(event) => { setSkuEdited(true); update("sku", event.target.value.toUpperCase()); }} placeholder="APP-047823" /><button className="outline icon-only" type="button" title="Regenerate SKU" onClick={() => regenerateSKU()}>↻</button></div>{skuError ? <small className="field-error">{skuError}</small> : null}</label>
+          <label className="field"><span>Barcode {barcodeEdited ? <em className="edited-note">Edited</em> : null}</span><div className="barcode-field-row"><input className="mono-input" value={form.barcode} onChange={(event) => { setBarcodeEdited(true); update("barcode", event.target.value.replace(/\D/g, "").slice(0, 13)); }} placeholder="8901234567890" /><button className="outline icon-only" type="button" title="Regenerate barcode" onClick={regenerateBarcode}>↻</button>{isMobileBrowser() ? <button className="outline" type="button" onClick={() => setScannerOpen(true)}>Scan</button> : null}</div>{barcodeError ? <small className="field-error">{barcodeError}</small> : null}</label>
+          {barcodePreview ? <div className="barcode-preview product-field-full" dangerouslySetInnerHTML={{ __html: barcodePreview }} /> : null}
+        </div>
+      </section>
+      <section className="product-form-section">
+        <label className="product-section-toggle"><input type="checkbox" checked={salesInfoEnabled} onChange={(event) => setSalesInfoEnabled(event.target.checked)} /><span>Sales Information</span></label>
+        {salesInfoEnabled ? <div className="product-form-grid">
+          <label className="field"><span>Selling Price*</span><div className="price-prefix-field"><span>₹</span><input type="number" value={String(form.price)} onChange={(event) => update("price", Number(event.target.value))} /></div></label>
+          <label className="field"><span>MRP</span><input type="number" value={String(form.mrp ?? "")} onChange={(event) => update("mrp", event.target.value === "" ? undefined : Number(event.target.value))} /></label>
+          <label className="field product-field-full"><span>Description</span><textarea value={form.description ?? ""} onChange={(event) => update("description", event.target.value)} placeholder="Add product description" /></label>
+        </div> : null}
+      </section>
       <div className="modal-actions end"><button className="primary" disabled={!required} onClick={saveProduct}>{product ? "Update Product" : "Create Product"}</button></div>
       <BarcodeScannerModal visible={scannerOpen} onClose={() => setScannerOpen(false)} onScanned={(value) => { setBarcodeEdited(true); update("barcode", value.replace(/\D/g, "").slice(0, 13)); setScannerOpen(false); }} />
     </Modal>
@@ -1810,32 +1945,15 @@ function PrintLabelsModal({ products, onClose }: { products: Product[]; onClose:
 function DateRangeFilter({ mode, setMode, customFrom, setCustomFrom, customTo, setCustomTo }: { mode: DateRangeMode; setMode: (mode: DateRangeMode) => void; customFrom: string; setCustomFrom: (value: string) => void; customTo: string; setCustomTo: (value: string) => void }) {
   return (
     <div className="range-filter">
-      {(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${mode === item ? "active" : ""}`} onClick={() => setMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}
-      {mode === "custom" ? <><input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /><input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></> : null}
+      <div className="range-filter-pills">
+        {(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${mode === item ? "active" : ""}`} onClick={() => setMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}
+      </div>
+      {mode === "custom" ? <div className="custom-date-row"><label><span>From</span><input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label><span>To</span><input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></div> : null}
     </div>
   );
 }
 
-function Performance() {
-  const { invoices, staff, attendance, setAttendance, showToast } = useApp();
-  const [tab, setTab] = useState<"sales" | "attendance">("sales");
-  const [rangeMode, setRangeMode] = useState<DateRangeMode>("today");
-  const [customFrom, setCustomFrom] = useState(dateInputKey(new Date()));
-  const [customTo, setCustomTo] = useState(dateInputKey(new Date()));
-  const range = rangeBounds(rangeMode, customFrom, customTo);
-  const owner = staff.find((member) => member.role === "Owner") ?? staff[0];
-
-  return (
-    <section className="page">
-      <PageHeader title="Performance" subtitle="Owner-only sales performance and attendance management." action={<DateRangeFilter mode={rangeMode} setMode={setRangeMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />} />
-      <div className="tab-row"><button className={tab === "sales" ? "active" : ""} onClick={() => setTab("sales")}>Sales Performance</button><button className={tab === "attendance" ? "active" : ""} onClick={() => setTab("attendance")}>Attendance</button></div>
-      {tab === "sales" ? <SalesPerformanceTab invoices={invoices} staff={staff} range={range} rangeMode={rangeMode} /> : <AttendanceTab staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} range={range} rangeMode={rangeMode} customFrom={customFrom} customTo={customTo} />}
-    </section>
-  );
-}
-
-function SalesPerformanceTab({ invoices, staff, range, rangeMode }: { invoices: Invoice[]; staff: Staff[]; range: { from: Date; to: Date }; rangeMode: DateRangeMode }) {
-  const [selected, setSelected] = useState<string | null>(null);
+function getPerformanceStats(invoices: Invoice[], range: { from: Date; to: Date }) {
   const filtered = invoices.filter((invoice) => {
     const time = new Date(invoice.date).getTime();
     return time >= range.from.getTime() && time <= range.to.getTime();
@@ -1855,10 +1973,18 @@ function SalesPerformanceTab({ invoices, staff, range, rangeMode }: { invoices: 
   }, {} as Record<string, { salespersonId: string; salespersonName: string; salesCount: number; totalRevenue: number; returnsCount: number; returnsValue: number }>))
     .map((row) => ({ ...row, avgSaleValue: row.salesCount ? row.totalRevenue / row.salesCount : 0, netRevenue: row.totalRevenue - row.returnsValue }))
     .sort((a, b) => (a.salespersonId === "unassigned" ? 1 : b.salespersonId === "unassigned" ? -1 : b.netRevenue - a.netRevenue));
-  const totalSales = stats.reduce((sum, row) => sum + row.totalRevenue, 0);
-  const salesCount = stats.reduce((sum, row) => sum + row.salesCount, 0);
-  const top = stats[0];
-  const activeToday = new Set(filtered.map((invoice) => invoice.salespersonId || "unassigned")).size;
+  return { filtered, stats };
+}
+
+function Performance() {
+  const { invoices, staff, attendance, setAttendance, showToast } = useApp();
+  const [tab, setTab] = useState<"sales" | "attendance">("sales");
+  const [rangeMode, setRangeMode] = useState<DateRangeMode>("today");
+  const [customFrom, setCustomFrom] = useState(dateInputKey(new Date()));
+  const [customTo, setCustomTo] = useState(dateInputKey(new Date()));
+  const range = rangeBounds(rangeMode, customFrom, customTo);
+  const owner = staff.find((member) => member.role === "Owner") ?? staff[0];
+  const { stats } = getPerformanceStats(invoices, range);
   const exportRows = () => {
     const rows = [["Rank", "Name", "Role", "Sales Count", "Total Revenue", "Avg Sale", "Returns Count", "Returns Value", "Net Revenue"], ...stats.map((row, index) => {
       const member = staff.find((item) => item.id === row.salespersonId);
@@ -1866,11 +1992,30 @@ function SalesPerformanceTab({ invoices, staff, range, rangeMode }: { invoices: 
     })];
     downloadFile(`performance_${rangeMode}_${Date.now()}.csv`, `\uFEFF${rows.map((row) => row.map(csvCell).join(",")).join("\n")}`, "text/csv;charset=utf-8");
   };
+
+  return (
+    <section className="page">
+      <PageHeader title="Performance" subtitle="Owner-only sales performance and attendance management." action={<DateRangeFilter mode={rangeMode} setMode={setRangeMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />} />
+      <div className="performance-tab-row">
+        <div className="performance-tabs"><button className={tab === "sales" ? "active" : ""} onClick={() => setTab("sales")}>Sales Performance</button><button className={tab === "attendance" ? "active" : ""} onClick={() => setTab("attendance")}>Attendance</button></div>
+        {tab === "sales" ? <button className="outline export-csv-btn" onClick={exportRows}>Export CSV</button> : null}
+      </div>
+      {tab === "sales" ? <SalesPerformanceTab invoices={invoices} staff={staff} range={range} /> : <AttendanceTab staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} range={range} rangeMode={rangeMode} customFrom={customFrom} customTo={customTo} />}
+    </section>
+  );
+}
+
+function SalesPerformanceTab({ invoices, staff, range }: { invoices: Invoice[]; staff: Staff[]; range: { from: Date; to: Date } }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const { filtered, stats } = getPerformanceStats(invoices, range);
+  const totalSales = stats.reduce((sum, row) => sum + row.totalRevenue, 0);
+  const salesCount = stats.reduce((sum, row) => sum + row.salesCount, 0);
+  const top = stats[0];
+  const activeToday = new Set(filtered.map((invoice) => invoice.salespersonId || "unassigned")).size;
   const selectedRows = selected ? filtered.filter((invoice) => (invoice.salespersonId || "unassigned") === selected).sort((a, b) => invoiceTime(b) - invoiceTime(a)) : [];
 
   return (
     <>
-      <div className="performance-actions"><button className="outline" onClick={exportRows}>Export CSV</button></div>
       <div className="performance-cards">
         <div><span>Top Performer</span><strong>{top?.salespersonName ?? "No sales"}</strong><small>{top ? `${INR.format(top.netRevenue)} in ${top.salesCount} sales` : "No transactions"}</small></div>
         <div><span>Total Sales</span><strong>{INR.format(totalSales)}</strong><small>{salesCount} transactions</small></div>
@@ -1892,7 +2037,7 @@ function AttendanceTab({ staff, owner, attendance, setAttendance, showToast, ran
   const [subtab, setSubtab] = useState<"mark" | "report" | "summary">("mark");
   return (
     <>
-      <div className="tab-row sub"><button className={subtab === "mark" ? "active" : ""} onClick={() => setSubtab("mark")}>Mark Attendance</button><button className={subtab === "report" ? "active" : ""} onClick={() => setSubtab("report")}>Attendance Report</button><button className={subtab === "summary" ? "active" : ""} onClick={() => setSubtab("summary")}>Monthly Summary</button></div>
+      <div className="attendance-subtabs"><button className={subtab === "mark" ? "active" : ""} onClick={() => setSubtab("mark")}>Mark Attendance</button><button className={subtab === "report" ? "active" : ""} onClick={() => setSubtab("report")}>Attendance Report</button><button className={subtab === "summary" ? "active" : ""} onClick={() => setSubtab("summary")}>Monthly Summary</button></div>
       {subtab === "mark" ? <MarkAttendance staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} /> : subtab === "report" ? <AttendanceReport staff={staff} attendance={attendance} range={range} rangeMode={rangeMode} /> : <MonthlySummary staff={staff} attendance={attendance} customFrom={customFrom} customTo={customTo} />}
     </>
   );
@@ -1939,11 +2084,12 @@ function MarkAttendance({ staff, owner, attendance, setAttendance, showToast }: 
 
 function AttendanceRow({ record, staff, update }: { record: AttendanceRecord; staff?: Staff; update: (staffId: string, patch: Partial<AttendanceRecord>) => void }) {
   const showTime = ["present", "late", "half-day"].includes(record.status);
+  const duration = hoursLabel(record.checkInTime, record.checkOutTime);
   return (
     <div className={`attendance-row ${record.status}`}>
       <div className="person-cell"><div className="avatar sm">{staffInitials(record.staffName)}</div><strong>{record.staffName}</strong><small>{staff?.role}</small></div>
       <div className="status-pills">{(["present", "absent", "half-day", "late", "leave"] as AttendanceStatus[]).map((status) => <button key={status} className={`${status} ${record.status === status ? "active" : ""}`} onClick={() => update(record.staffId, { status })}>{statusShort(status)}</button>)}</div>
-      {showTime ? <><input type="time" value={record.checkInTime ?? ""} onChange={(event) => update(record.staffId, { checkInTime: event.target.value })} /><input type="time" value={record.checkOutTime ?? ""} onChange={(event) => update(record.staffId, { checkOutTime: event.target.value })} /><small>{record.hoursWorked === undefined ? "Invalid time" : `${record.hoursWorked} hrs`}</small></> : <span className="muted">No hours</span>}
+      {showTime ? <div className="time-section"><span><TimeInput value={record.checkInTime ?? ""} onChange={(time) => update(record.staffId, { checkInTime: time })} /><em>{amPm(record.checkInTime)}</em></span><span><TimeInput value={record.checkOutTime ?? ""} onChange={(time) => update(record.staffId, { checkOutTime: time })} /><em>{amPm(record.checkOutTime)}</em></span><small className={duration === "Invalid" ? "red-text" : ""}>{duration || "--"}</small></div> : <span className="muted">No hours</span>}
       <input value={record.notes ?? ""} onChange={(event) => update(record.staffId, { notes: event.target.value })} placeholder="Note" />
     </div>
   );
@@ -1962,7 +2108,7 @@ function AttendanceReport({ staff, attendance, range, rangeMode }: { staff: Staf
   };
   return (
     <div className="attendance-panel">
-      <div className="filters"><select value={staffId} onChange={(event) => setStaffId(event.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select><div className="tab-row compact"><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}>List View</button><button className={view === "calendar" ? "active" : ""} onClick={() => setView("calendar")}>Calendar View</button></div><button className="outline" onClick={exportRows}>Export Attendance</button></div>
+      <div className="attendance-toolbar"><select value={staffId} onChange={(event) => setStaffId(event.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select><div className="attendance-toolbar-bottom"><div className="view-toggle"><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}><List size={14} />List View</button><button className={view === "calendar" ? "active" : ""} onClick={() => setView("calendar")}><CalendarDays size={14} />Calendar View</button></div><button className="outline attendance-export" onClick={exportRows}><Download size={16} /><span>Export Attendance</span></button></div></div>
       {view === "list" ? <DataTable headers={["Date", "Staff Name", "Status", "Check-in", "Check-out", "Hours", "Notes"]}>{rows.length ? rows.map((record) => <tr key={record.id}><td>{longDate(new Date(record.date))}</td><td>{record.staffName}</td><td><span className={`attendance-badge ${record.status}`}>{statusLabel(record.status)}</span></td><td>{record.checkInTime ?? "--"}</td><td>{record.checkOutTime ?? "--"}</td><td>{record.hoursWorked ?? "--"}</td><td>{record.notes ?? ""}</td></tr>) : <tr><td className="empty-table" colSpan={7}>No attendance records found.</td></tr>}</DataTable> : <AttendanceCalendar records={rows} staff={staff} month={range.from} />}</div>
   );
 }
@@ -2002,7 +2148,7 @@ function MonthlySummary({ staff, attendance, customFrom }: { staff: Staff[]; att
   };
   return (
     <div className="attendance-panel">
-      <div className="attendance-head"><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1)).slice(0, 7))}>Prev</button><input type="month" value={month} onChange={(event) => setMonth(event.target.value)} /><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1)).slice(0, 7))}>Next</button><button className="outline" onClick={exportRows}>Export Summary</button></div>
+      <div className="attendance-head monthly-summary-head"><div className="month-nav-group"><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1)).slice(0, 7))}>Prev</button><input type="month" value={month} onChange={(event) => setMonth(event.target.value)} /><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1)).slice(0, 7))}>Next</button></div><button className="outline" onClick={exportRows}>Export Summary</button></div>
       <div className="performance-cards"><div><span>Working Days</span><strong>{totalDays}</strong><small>Calendar days</small></div><div><span>Perfect Attendance</span><strong>{perfect}</strong><small>Staff at 100%</small></div><div><span>Avg Attendance</span><strong>{avg.toFixed(1)}%</strong><small>Across team</small></div><div><span>Most Absent</span><strong>{mostAbsent?.member.name ?? "None"}</strong><small>{mostAbsent?.absent ?? 0} absent days</small></div></div>
       <DataTable headers={["Staff", "Present", "Absent", "Half-Day", "Late", "Leave", "Hours", "Attendance %", "Salary Days"]}>{rows.map((row) => <tr key={row.member.id}><td>{row.member.name}</td><td>{row.present}</td><td>{row.absent}</td><td>{row.half}</td><td>{row.late}</td><td>{row.leave}</td><td>{row.hours.toFixed(1)}</td><td><span className={`attendance-percent ${row.percentage >= 90 ? "good" : row.percentage >= 75 ? "warn" : "bad"}`}>{row.percentage.toFixed(1)}%</span></td><td><input className="salary-days-input" type="number" defaultValue={row.salaryDays} /></td></tr>)}</DataTable>
     </div>
@@ -2079,23 +2225,300 @@ function Reports() {
 }
 
 function ExpenseModal({ onClose, onSave }: { onClose: () => void; onSave: (expense: Expense) => void }) {
-  const [category, setCategory] = useState("Inventory");
-  const [otherCategory, setOtherCategory] = useState("");
+  const [category, setCategory] = useState<ExpenseCategory>("inventory");
   const [vendor, setVendor] = useState("");
+  const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
-  const [payment, setPayment] = useState("Cash");
+  const [paymentMode, setPaymentMode] = useState<PaymentMode>("cash");
   const valid = Number(amount) > 0;
-  const savedCategory = category === "Other" && otherCategory.trim() ? otherCategory.trim() : category;
 
   return (
     <Modal onClose={onClose} className="drawer-modal">
       <div className="modal-head"><div><h2>Add Expense</h2><p>Record outgoing cash for reports.</p></div><button onClick={onClose}><X size={20} /></button></div>
-      <div className="form-grid two"><label className="field"><span>Category</span><select value={category} onChange={(e) => setCategory(e.target.value)}><option>Inventory</option><option>Rent</option><option>Utilities</option><option>Packaging</option><option>Maintenance</option><option>Salary</option><option>Other</option></select></label><TextField label="Vendor / Note" value={vendor} onChange={setVendor} placeholder="e.g. Supplier Hub" /></div>
-      {category === "Other" && <TextField label="Other Category (Optional)" value={otherCategory} onChange={setOtherCategory} placeholder="e.g. Travel, repairs" />}
-      <div className="form-grid two"><TextField label="Amount" type="number" value={amount} onChange={setAmount} placeholder="0.00" /><label className="field"><span>Payment</span><select value={payment} onChange={(e) => setPayment(e.target.value)}><option>Cash</option><option>Card</option><option>UPI</option><option>Bank</option></select></label></div>
-      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!valid} onClick={() => valid && onSave({ id: `EXP-${String(Date.now()).slice(-4)}`, date: "Jun 5, 2026 5:30 PM", category: savedCategory, vendor: vendor.trim() || "-", amount: Number(amount), payment })}>Save Expense</button></div>
+      <div className="form-grid two"><label className="field"><span>Category</span><select value={category} onChange={(e) => setCategory(e.target.value as ExpenseCategory)}>{Object.entries(expenseCategoryLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label><TextField label="Vendor / Note" value={vendor} onChange={setVendor} placeholder="e.g. Supplier Hub" /></div>
+      <TextField label="Description" value={description} onChange={setDescription} placeholder="e.g. Stock purchase" />
+      <div className="form-grid two"><TextField label="Amount" type="number" value={amount} onChange={setAmount} placeholder="0.00" /><label className="field"><span>Payment</span><select value={paymentMode} onChange={(e) => setPaymentMode(e.target.value as PaymentMode)}>{Object.entries(paymentLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!valid} onClick={() => valid && onSave({ id: `EXP-${String(Date.now()).slice(-4)}`, date: new Date().toISOString(), category, description: description.trim() || expenseCategoryLabels[category], vendor: vendor.trim() || "-", amount: Number(amount), payment: paymentLabels[paymentMode], paymentMode, createdBy: "Admin Owner", createdAt: new Date().toISOString() })}>Save Expense</button></div>
     </Modal>
   );
+}
+
+const expenseCategoryLabels: Record<ExpenseCategory, string> = {
+  rent: "Rent",
+  utilities: "Utilities",
+  salary: "Salary",
+  inventory: "Inventory",
+  marketing: "Marketing",
+  maintenance: "Maintenance",
+  transport: "Transport",
+  miscellaneous: "Miscellaneous",
+  other: "Other",
+};
+
+function expenseCategoryLabel(category: string) {
+  return expenseCategoryLabels[category as ExpenseCategory] ?? category;
+}
+
+const paymentLabels: Record<PaymentMode, string> = {
+  cash: "Cash",
+  bank_transfer: "Bank Transfer",
+  upi: "UPI",
+  card: "Card",
+  cheque: "Cheque",
+};
+
+function nextCode(prefix: string, items: Array<{ id: string }>) {
+  const max = items.reduce((value, item) => {
+    const number = Number(item.id.replace(`${prefix}-`, ""));
+    return Number.isFinite(number) ? Math.max(value, number) : value;
+  }, 0);
+  return `${prefix}-${String(max + 1).padStart(4, "0")}`;
+}
+
+function SuppliersScreen() {
+  const { suppliers, setSuppliers, purchaseOrders, showToast } = useApp();
+  const navigate = useNavigate();
+  const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState<Supplier | null>(null);
+  const [open, setOpen] = useState(false);
+  const rows = suppliers.filter((supplier) => `${supplier.name} ${supplier.phone} ${supplier.gstin ?? ""}`.toLowerCase().includes(query.toLowerCase()));
+
+  return (
+    <section className="page">
+      <PageHeader title="Suppliers" subtitle="Manage your product suppliers." action={<button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Supplier</button>} />
+      <label className="searchbox top-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search supplier, phone, or GSTIN" /></label>
+      <DataTable headers={["Name", "Contact", "Phone", "GSTIN", "Orders", "Balance", "Actions"]}>
+        {rows.length ? rows.map((supplier) => {
+          const orders = purchaseOrders.filter((po) => po.supplierId === supplier.id && po.status !== "cancelled");
+          const balance = orders.filter((po) => po.status !== "received").reduce((sum, po) => sum + po.grandTotal, 0);
+          return <tr key={supplier.id}><td><strong>{supplier.name}</strong><small>{supplier.paymentTerms ?? "Immediate"}</small></td><td>{supplier.contactPerson || "-"}</td><td>{supplier.phone}</td><td>{supplier.gstin || "-"}</td><td>{orders.length}</td><td><strong>{INR.format(balance)}</strong></td><td className="actions"><button title="Edit" onClick={() => { setEditing(supplier); setOpen(true); }}><Pencil size={16} /></button><button title="View Orders" onClick={() => navigate("/purchase-orders")}><Eye size={16} /></button><button title="Delete" onClick={() => { setSuppliers((items) => items.filter((item) => item.id !== supplier.id)); showToast("Supplier deleted"); }}><Trash2 size={16} /></button></td></tr>;
+        }) : <tr><td colSpan={7}><div className="empty compact">No suppliers added yet. Add your first supplier.</div></td></tr>}
+      </DataTable>
+      {open ? <SupplierModal supplier={editing} onClose={() => setOpen(false)} onSave={(supplier) => {
+        setSuppliers((items) => editing ? items.map((item) => item.id === editing.id ? supplier : item) : [supplier, ...items]);
+        showToast(editing ? "Supplier updated" : "Supplier added");
+        setOpen(false);
+      }} /> : null}
+    </section>
+  );
+}
+
+function SupplierModal({ supplier, onClose, onSave }: { supplier: Supplier | null; onClose: () => void; onSave: (supplier: Supplier) => void }) {
+  const [form, setForm] = useState<Supplier>(supplier ?? { id: crypto.randomUUID(), name: "", phone: "", paymentTerms: "Immediate", createdAt: new Date().toISOString(), isActive: true });
+  const valid = form.name.trim() && form.phone.trim() && (!form.gstin || form.gstin.trim().length >= 13);
+  const update = <K extends keyof Supplier>(key: K, value: Supplier[K]) => setForm((draft) => ({ ...draft, [key]: value }));
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><div><h2>{supplier ? "Edit Supplier" : "Add Supplier"}</h2><p>Supplier profile and payment details.</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="form-grid two"><TextField label="Supplier Name" value={form.name} onChange={(value) => update("name", value)} /><TextField label="Contact Person" value={form.contactPerson ?? ""} onChange={(value) => update("contactPerson", value)} /></div>
+      <div className="form-grid two"><TextField label="Phone" value={form.phone} onChange={(value) => update("phone", value)} /><TextField label="Email" type="email" value={form.email ?? ""} onChange={(value) => update("email", value)} /></div>
+      <div className="form-grid two"><TextField label="GSTIN" value={form.gstin ?? ""} onChange={(value) => update("gstin", value.toUpperCase().slice(0, 15))} /><label className="field"><span>Payment Terms</span><select value={form.paymentTerms ?? "Immediate"} onChange={(event) => update("paymentTerms", event.target.value as Supplier["paymentTerms"])}><option>Immediate</option><option>Net 7</option><option>Net 15</option><option>Net 30</option></select></label></div>
+      <label className="field"><span>Address</span><textarea value={form.address ?? ""} onChange={(event) => update("address", event.target.value)} placeholder="Supplier address" /></label>
+      <label className="field"><span>Notes</span><textarea value={form.notes ?? ""} onChange={(event) => update("notes", event.target.value)} placeholder="Internal notes" /></label>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!valid} onClick={() => valid && onSave({ ...form, name: form.name.trim(), phone: form.phone.trim() })}>Save Supplier</button></div>
+    </Modal>
+  );
+}
+
+function PurchaseOrdersScreen() {
+  const { purchaseOrders, setPurchaseOrders, suppliers, products, setProducts, showToast } = useApp();
+  const [status, setStatus] = useState<"all" | POStatus>("all");
+  const [supplierId, setSupplierId] = useState("all");
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<PurchaseOrder | null>(null);
+  const [receiving, setReceiving] = useState<PurchaseOrder | null>(null);
+  const rows = purchaseOrders.filter((po) => (status === "all" || po.status === status) && (supplierId === "all" || po.supplierId === supplierId));
+
+  return (
+    <section className="page purchase-orders-page">
+      <div className="po-page-header"><div className="po-header-top"><div><h1>Purchase Orders</h1><p>Track stock procurement from suppliers.</p></div><button className="primary po-new-button" onClick={() => { setEditing(null); setOpen(true); }}><span>+</span><span>New PO</span></button></div><div className="po-header-toolbar"><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value as "all" | POStatus)}><option value="all">All Status</option><option value="draft">Draft</option><option value="sent">Sent</option><option value="partial">Partial</option><option value="received">Received</option><option value="cancelled">Cancelled</option></select><select className="filter-select" value={supplierId} onChange={(event) => setSupplierId(event.target.value)}><option value="all">All Suppliers</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></div></div>
+      <DataTable headers={["PO No.", "Date", "Supplier", "Items", "Total", "Status", "Actions"]}>
+        {rows.map((po) => <tr key={po.id}><td className="linkish">{po.id}</td><td>{new Date(po.orderDate).toLocaleDateString("en-IN")}</td><td>{po.supplierName}</td><td>{po.items.length} items</td><td><strong>{INR.format(po.grandTotal)}</strong></td><td><span className={`po-status ${po.status}`}>{po.status}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(po); setOpen(true); }}><Eye size={16} /></button>{po.status === "draft" ? <button title="Edit Draft" onClick={() => { setEditing(po); setOpen(true); }}><Edit size={16} /></button> : null}{po.status !== "received" && po.status !== "cancelled" ? <button title="Receive Goods" onClick={() => setReceiving(po)}><PackagePlus size={16} /></button> : null}<button title="Cancel" onClick={() => setPurchaseOrders((items) => items.map((item) => item.id === po.id ? { ...item, status: "cancelled", updatedAt: new Date().toISOString() } : item))}><Trash2 size={16} /></button></td></tr>)}
+      </DataTable>
+      {open ? <PurchaseOrderModal po={editing} products={products} suppliers={suppliers} purchaseOrders={purchaseOrders} onClose={() => setOpen(false)} onSave={(po) => {
+        setPurchaseOrders((items) => editing ? items.map((item) => item.id === editing.id ? po : item) : [po, ...items]);
+        showToast(`${po.id} saved`);
+        setOpen(false);
+      }} /> : null}
+      {receiving ? <ReceiveGoodsModal po={receiving} onClose={() => setReceiving(null)} onReceive={(received) => {
+        let updatedCount = 0;
+        setPurchaseOrders((items) => items.map((po) => {
+          if (po.id !== receiving.id) return po;
+          const nextItems = po.items.map((item) => {
+            const addQty = received[item.id] ?? 0;
+            if (addQty > 0) updatedCount += 1;
+            return { ...item, receivedQty: Math.min(item.orderedQty, item.receivedQty + addQty) };
+          });
+          const allReceived = nextItems.every((item) => item.receivedQty >= item.orderedQty);
+          const hasReceived = nextItems.some((item) => item.receivedQty > 0);
+          return { ...po, items: nextItems, status: allReceived ? "received" : hasReceived ? "partial" : po.status, receivedDate: allReceived ? new Date().toISOString() : po.receivedDate, updatedAt: new Date().toISOString() };
+        }));
+        setProducts((items) => items.map((product) => {
+          const poItem = receiving.items.find((item) => item.productId === product.id);
+          const addQty = poItem ? received[poItem.id] ?? 0 : 0;
+          return addQty > 0 ? { ...product, stock: product.stock + addQty, costPrice: poItem?.unitCost } : product;
+        }));
+        showToast(`Stock updated for ${updatedCount} products`);
+        setReceiving(null);
+      }} /> : null}
+    </section>
+  );
+}
+
+function PurchaseOrderModal({ po, suppliers, products, purchaseOrders, onClose, onSave }: { po: PurchaseOrder | null; suppliers: Supplier[]; products: Product[]; purchaseOrders: PurchaseOrder[]; onClose: () => void; onSave: (po: PurchaseOrder) => void }) {
+  const [supplierId, setSupplierId] = useState(po?.supplierId ?? suppliers[0]?.id ?? "");
+  const [orderDate, setOrderDate] = useState(dateKey(po?.orderDate ?? new Date().toISOString()));
+  const [expectedDate, setExpectedDate] = useState(po?.expectedDate ?? "");
+  const [notes, setNotes] = useState(po?.notes ?? "");
+  const [items, setItems] = useState<POItem[]>(po?.items ?? (products[0] ? [buildPOItem(products[0], 1, 0, Math.round(products[0].price * 0.65 * 100) / 100)] : []));
+  const supplier = suppliers.find((item) => item.id === supplierId);
+  const totals = totalsForPO(items);
+  const updateItem = (id: string, next: Partial<POItem>) => setItems((current) => current.map((item) => {
+    if (item.id !== id) return item;
+    const merged = { ...item, ...next };
+    return { ...buildPOItem({ ...products.find((product) => product.id === merged.productId)!, gstRate: merged.gstRate, name: merged.productName, sku: merged.sku }, merged.orderedQty, merged.receivedQty, merged.unitCost), id: item.id };
+  }));
+  const selectProduct = (id: string, productId: string) => {
+    const product = products.find((item) => item.id === productId);
+    if (!product) return;
+    setItems((current) => current.map((item) => item.id === id ? { ...buildPOItem(product, item.orderedQty, item.receivedQty, product.costPrice ?? Math.round(product.price * 0.65 * 100) / 100), id: item.id } : item));
+  };
+  const save = (status: POStatus) => {
+    if (!supplier || !items.length) return;
+    onSave({ id: po?.id ?? nextCode("PO", purchaseOrders), supplierId: supplier.id, supplierName: supplier.name, supplierGSTIN: supplier.gstin, status, items, ...totals, orderDate: new Date(orderDate).toISOString(), expectedDate, notes, createdBy: "Admin Owner", createdAt: po?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
+  };
+  return (
+    <Modal onClose={onClose} className="wide-modal">
+      <div className="modal-head"><div><h2>{po ? po.id : "New Purchase Order"}</h2><p>Supplier order, GST breakdown, and receiving workflow.</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="form-grid three"><label className="field"><span>Supplier</span><select value={supplierId} onChange={(event) => setSupplierId(event.target.value)}>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></label><TextField label="Order Date" type="date" value={orderDate} onChange={setOrderDate} /><TextField label="Expected Delivery" type="date" value={expectedDate} onChange={setExpectedDate} /></div>
+      <label className="field"><span>Notes</span><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
+      <div className="po-items"><div className="po-items-head"><strong>Items</strong><button className="outline" onClick={() => products[0] && setItems((current) => [...current, buildPOItem(products[0], 1, 0, products[0].costPrice ?? products[0].price * 0.65)])}>Add Another Item</button></div>{items.map((item) => <div className="po-item-row" key={item.id}><label><span>Product</span><select value={item.productId} onChange={(event) => selectProduct(item.id, event.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label><label><span>SKU</span><input readOnly value={item.sku} /></label><label><span>Qty</span><input type="number" min="0" step="1" value={item.orderedQty} onFocus={(event) => event.currentTarget.select()} onChange={(event) => updateItem(item.id, { orderedQty: Number.parseFloat(event.target.value) || 0 })} /></label><label><span>Unit Cost ₹</span><input type="number" min="0" step="0.01" value={item.unitCost} onFocus={(event) => event.currentTarget.select()} onChange={(event) => updateItem(item.id, { unitCost: Number.parseFloat(event.target.value) || 0 })} /></label><label><span>GST %</span><select value={item.gstRate} onChange={(event) => updateItem(item.id, { gstRate: Number(event.target.value) })}><option value={0}>0</option><option value={5}>5</option><option value={12}>12</option><option value={18}>18</option><option value={28}>28</option></select></label><strong>{INR.format(item.lineTotal)}</strong><button className="danger-light" onClick={() => setItems((current) => current.filter((row) => row.id !== item.id))}>Remove</button><small>CGST {INR.format(item.cgst)} · SGST {INR.format(item.sgst)}</small></div>)}</div>
+      <div className="totals-box"><span>Subtotal <strong>{INR.format(totals.subtotal)}</strong></span><span>Total CGST <strong>{INR.format(totals.totalCGST)}</strong></span><span>Total SGST <strong>{INR.format(totals.totalSGST)}</strong></span><span>Grand Total <strong>{INR.format(totals.grandTotal)}</strong></span></div>
+      <div className="modal-actions"><button className="outline" onClick={onClose}>Cancel</button><button className="outline" disabled={!supplier || !items.length} onClick={() => save("draft")}>Save as Draft</button><button className="primary" disabled={!supplier || !items.length} onClick={() => save("sent")}>Send to Supplier</button></div>
+    </Modal>
+  );
+}
+
+function ReceiveGoodsModal({ po, onClose, onReceive }: { po: PurchaseOrder; onClose: () => void; onReceive: (received: Record<string, number>) => void }) {
+  const [received, setReceived] = useState<Record<string, number>>({});
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><div><h2>Receive Goods</h2><p>{po.id} · {po.supplierName}</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="receive-list">{po.items.map((item) => {
+        const remaining = Math.max(0, item.orderedQty - item.receivedQty);
+        return <div className="receive-row" key={item.id}><div><strong>{item.productName}</strong><span>Ordered {item.orderedQty} · Received {item.receivedQty} · Pending {remaining}</span></div><input type="number" min="0" max={remaining} defaultValue={0} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setReceived((draft) => ({ ...draft, [item.id]: Math.min(remaining, Number.parseInt(event.target.value, 10) || 0) }))} /></div>;
+      })}</div>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" onClick={() => onReceive(received)}>Confirm Receipt</button></div>
+    </Modal>
+  );
+}
+
+function ExpensesScreen() {
+  const { expenses, setExpenses, showToast } = useApp();
+  const [mode, setMode] = useState<DateRangeMode>("month");
+  const [customFrom, setCustomFrom] = useState(dateKey(new Date().toISOString()));
+  const [customTo, setCustomTo] = useState(dateKey(new Date().toISOString()));
+  const [category, setCategory] = useState<"all" | ExpenseCategory>("all");
+  const [editing, setEditing] = useState<Expense | null>(null);
+  const [open, setOpen] = useState(false);
+  const range = rangeBounds(mode, customFrom, customTo);
+  const periodExpenses = expenses.filter((expense) => new Date(expense.date) >= range.from && new Date(expense.date) <= range.to && (category === "all" || expense.category === category));
+  const total = periodExpenses.reduce((sum, expense) => sum + expense.amount, 0);
+  const byCategory = Object.entries(periodExpenses.reduce<Record<string, number>>((totals, expense) => ({ ...totals, [expense.category]: (totals[expense.category] ?? 0) + expense.amount }), {})).sort((a, b) => b[1] - a[1]);
+  const largest = byCategory[0];
+  const avgDaily = total / Math.max(1, Math.ceil((range.to.getTime() - range.from.getTime()) / 86400000));
+  const monthlyExpenseData = monthlyData.map((item, index) => ({ month: item.month, revenue: 280 + index * 75 + (index % 2 ? 90 : 0) }));
+  return (
+    <section className="page">
+      <div className="page-header expenses-page-header">
+        <div><h1>Expenses</h1><p>Track operating expenses and category trends.</p></div>
+        <button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Expense</button>
+        <div className="expenses-filter-inline"><DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} /></div>
+      </div>
+      <div className="cashflow-grid"><div className="card cash-card"><span>Total Expenses</span><strong>{INR.format(total)}</strong><small>{periodExpenses.length} records</small></div><div className="card cash-card"><span>Largest Category</span><strong>{largest ? expenseCategoryLabels[largest[0] as ExpenseCategory] : "-"}</strong><small>{largest ? INR.format(largest[1]) : "No spend"}</small></div><div className="card cash-card"><span>Avg Daily Expense</span><strong>{INR.format(avgDaily)}</strong><small>Selected period</small></div></div>
+      <div className="report-grid"><div className="card"><h2>Category Breakdown</h2><div className="category-breakdown">{byCategory.map(([name, amount]) => <div className="category-row-item" key={name}><div><strong>{expenseCategoryLabel(name)}</strong><span>{Math.round((amount / Math.max(total, 1)) * 100)}%</span></div><div className="progress"><i style={{ width: `${Math.round((amount / Math.max(total, 1)) * 100)}%` }} /></div><b>{INR.format(amount)}</b></div>)}</div></div><div className="card chart-card"><h2>Monthly Expense Trend</h2><RevenueChart data={monthlyExpenseData} xKey="month" height={260} /></div></div>
+      <div className="section-head"><h2>All Expenses</h2><label className="field compact"><select value={category} onChange={(event) => setCategory(event.target.value as "all" | ExpenseCategory)}><option value="all">All Categories</option>{Object.entries(expenseCategoryLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
+      <DataTable headers={["Date", "Description", "Category", "Vendor", "Amount", "Payment", "Actions"]}>
+        {periodExpenses.length ? periodExpenses.map((expense) => <tr key={expense.id}><td>{new Date(expense.date).toLocaleDateString("en-IN")}</td><td><strong>{expense.description}</strong><small>{expense.receiptNo ?? ""}</small></td><td><span className={`expense-badge ${expense.category}`}>{expenseCategoryLabel(expense.category)}</span></td><td>{expense.vendor ?? "-"}</td><td><strong>{INR.format(expense.amount)}</strong></td><td>{paymentLabels[expense.paymentMode]}</td><td className="actions"><button onClick={() => { setEditing(expense); setOpen(true); }}><Edit size={16} /></button><button onClick={() => { setExpenses((items) => items.filter((item) => item.id !== expense.id)); showToast("Expense deleted"); }}><Trash2 size={16} /></button></td></tr>) : <tr><td colSpan={7}><div className="empty compact">No expenses recorded. Add your first expense.</div></td></tr>}
+      </DataTable>
+      {open ? <ExpenseEditorModal expense={editing} expenses={expenses} onClose={() => setOpen(false)} onSave={(expense) => {
+        setExpenses((items) => editing ? items.map((item) => item.id === editing.id ? expense : item) : [expense, ...items]);
+        showToast(editing ? "Expense updated" : "Expense recorded");
+        setOpen(false);
+      }} /> : null}
+    </section>
+  );
+}
+
+function ExpenseEditorModal({ expense, expenses, onClose, onSave }: { expense: Expense | null; expenses: Expense[]; onClose: () => void; onSave: (expense: Expense) => void }) {
+  const [form, setForm] = useState<Expense>(expense ?? { id: nextCode("EXP", expenses), category: "inventory", description: "", amount: 0, paymentMode: "cash", payment: "Cash", vendor: "", date: new Date().toISOString(), createdBy: "Admin Owner", createdAt: new Date().toISOString() });
+  const [customCategory, setCustomCategory] = useState("");
+  const update = <K extends keyof Expense>(key: K, value: Expense[K]) => setForm((draft) => ({ ...draft, [key]: value }));
+  const valid = form.description.trim() && form.amount > 0;
+  const finalCategory = form.category === "other" ? (customCategory.trim() || "other") : form.category;
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><div><h2>{expense ? "Edit Expense" : "Add Expense"}</h2><p>Record outgoing cash with category reporting.</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="form-grid two"><TextField label="Date" type="date" value={dateKey(form.date)} onChange={(value) => update("date", new Date(value).toISOString())} /><label className="field"><span>Category</span><select value={form.category} onChange={(event) => update("category", event.target.value as ExpenseCategory)}>{Object.entries(expenseCategoryLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select>{form.category === "other" && <div style={{ marginTop: "8px" }}><input type="text" placeholder="Enter category (optional)" value={customCategory} onChange={(event) => setCustomCategory(event.target.value)} style={{ width: "100%", height: "36px", padding: "0 10px", border: "0.5px solid #e5e7eb", borderRadius: "6px", fontSize: "13px", fontFamily: "inherit", color: "#111827" }} /><span style={{ fontSize: "11px", color: "#9ca3af", marginTop: "4px", display: "block" }}>This field is optional</span></div>}</label></div>
+      <TextField label="Description" value={form.description} onChange={(value) => update("description", value)} placeholder="e.g. Staff salary, rent, electricity" />
+      <div className="form-grid two"><TextField label="Amount ₹" type="number" value={String(form.amount)} onChange={(value) => update("amount", Number(value))} /><label className="field"><span>Payment Mode</span><select value={form.paymentMode} onChange={(event) => { const value = event.target.value as PaymentMode; update("paymentMode", value); update("payment", paymentLabels[value]); }}>{Object.entries(paymentLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
+      <div className="form-grid two"><TextField label="Vendor / Paid To" value={form.vendor ?? ""} onChange={(value) => update("vendor", value)} /><TextField label="Receipt No." value={form.receiptNo ?? ""} onChange={(value) => update("receiptNo", value)} /></div>
+      <label className="field"><span>Notes</span><textarea value={form.notes ?? ""} onChange={(event) => update("notes", event.target.value)} /></label>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!valid} onClick={() => valid && onSave({ ...form, category: finalCategory as ExpenseCategory })}>Save Expense</button></div>
+    </Modal>
+  );
+}
+
+function PnLScreen() {
+  const { invoices, purchaseOrders, expenses, products } = useApp();
+  const [mode, setMode] = useState<DateRangeMode>("month");
+  const [customFrom, setCustomFrom] = useState(dateKey(new Date().toISOString()));
+  const [customTo, setCustomTo] = useState(dateKey(new Date().toISOString()));
+  const range = rangeBounds(mode, customFrom, customTo);
+  const report = computePnLFromData({ from: range.from, to: range.to, sales: invoices, purchases: purchaseOrders, expenses, products });
+  const pnlRows = [
+    ["Gross Sales", report.grossRevenue],
+    ["Less: Returns", -report.returnsValue],
+    ["Net Revenue", report.netRevenue],
+    ["Purchases", report.purchasesValue],
+    ["Cost of Goods Sold", report.cogs],
+    ["Gross Profit", report.grossProfit],
+    ["Total Expenses", report.totalExpenses],
+    ["Net Profit", report.netProfit],
+    ["Output GST", report.outputGST],
+    ["Input GST", -report.inputGST],
+    ["Net GST Payable", report.netGSTPayable],
+  ];
+  const exportCSV = () => {
+    const csv = ["Line,Amount", ...pnlRows.map(([label, amount]) => `${label},${amount}`)].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "profit-and-loss.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+  const exportPDF = () => {
+    const rows = pnlRows.map(([label, amount]) => `<tr><td>${label}</td><td class="amount">${INR.format(Number(amount))}</td></tr>`).join("");
+    const w = window.open("", "_blank");
+    if (w) {
+      w.document.write(`<!doctype html><html><head><title>P&L Report</title><style>body{font-family:Inter,Arial,sans-serif;padding:32px;color:#111827}h1{font-size:22px}table{width:100%;border-collapse:collapse}td{padding:10px 12px;border-bottom:1px solid #E5E7EB}.amount{text-align:right;font-weight:700}</style></head><body><h1>Profit & Loss Report</h1><p>${range.from.toLocaleDateString("en-IN")} to ${range.to.toLocaleDateString("en-IN")}</p><table>${rows}</table></body></html>`);
+      w.document.close();
+      w.print();
+    }
+  };
+  return (
+    <section className="page pnl-page">
+      <PageHeader title="Profit & Loss" subtitle="Financial performance overview." action={<div className="toolbar-actions"><button className="outline" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary" onClick={exportPDF}>Export PDF</button></div>} />
+      <DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />
+      <div className="pnl-kpi-row"><div className="card cash-card pnl-kpi-card"><span>Net Revenue</span><strong>{INR.format(report.netRevenue)}</strong><small>Sales minus returns</small></div><div className="card cash-card pnl-kpi-card"><span>Gross Profit</span><strong className={report.grossProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.grossProfit)}</strong><small>{report.grossMarginPct.toFixed(1)}% margin</small></div><div className="card cash-card pnl-kpi-card"><span>Total Expenses</span><strong>{INR.format(report.totalExpenses)}</strong><small>Operating spend</small></div><div className="card cash-card pnl-kpi-card"><span>Net Profit</span><strong className={report.netProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.netProfit)}</strong><small>{report.netMarginPct.toFixed(1)}% net margin</small></div></div>
+      <div className="report-grid"><div className="card pnl-statement"><h2>P&L Statement</h2><StatementSection title="Revenue" rows={[["Gross Sales", report.grossRevenue], ["Less: Returns", -report.returnsValue], ["Net Revenue", report.netRevenue]]} /><StatementSection title="Cost of Goods Sold" rows={[["Purchases", report.purchasesValue], ["Closing Stock", report.closingStock], ["Cost of Goods Sold", report.cogs]]} /><StatementSection title="Operating Expenses" rows={[...report.expensesByCategory.map((item) => [expenseCategoryLabels[item.category as ExpenseCategory] ?? item.category, item.amount] as [string, number]), ["Total Expenses", report.totalExpenses]]} /><StatementSection title="GST Summary" rows={[["Output GST", report.outputGST], ["Input GST", -report.inputGST], ["Net GST Payable", report.netGSTPayable]]} /><div className={`statement-total ${report.netProfit >= 0 ? "profit" : "loss"}`}><span>Net Profit</span><strong>{INR.format(report.netProfit)}</strong></div></div><div className="card chart-card"><h2>Revenue vs Expenses</h2><ResponsiveContainer width="100%" height={300}><BarChart data={monthlyData.map((item, index) => ({ month: item.month, revenue: item.revenue, expenses: 500 + index * 120, profit: item.revenue - (500 + index * 120) }))} barCategoryGap="16%" margin={{ top: 10, right: 20, left: 0, bottom: 0 }}><CartesianGrid vertical={false} stroke="#E5E7EB" /><XAxis dataKey="month" /><YAxis tickFormatter={(value) => `₹${Number(value) / 1000}k`} /><Tooltip formatter={(value) => INR.format(Number(value))} /><Bar dataKey="revenue" fill="#2563EB" radius={[4, 4, 0, 0]} maxBarSize={52} /><Bar dataKey="expenses" fill="#EF4444" radius={[4, 4, 0, 0]} maxBarSize={52} /></BarChart></ResponsiveContainer></div></div>
+    </section>
+  );
+}
+
+function StatementSection({ title, rows }: { title: string; rows: Array<[string, number]> }) {
+  return <div className="statement-section"><h3>{title}</h3>{rows.map(([label, amount]) => <div className="statement-row" key={label}><span>{label}</span><strong className={amount < 0 ? "red-text" : ""}>{amount < 0 ? `(${INR.format(Math.abs(amount))})` : INR.format(amount)}</strong></div>)}</div>;
 }
 
 function StaffPage() {
@@ -2131,7 +2554,7 @@ function StaffModal({ staff, onClose, onSave }: { staff: Staff | null; onClose: 
       <div className="modal-head"><div><h2>{staff ? "Edit Staff Member" : "Add New Staff Member"}</h2><p>Create a new account for your staff member.</p></div><button onClick={onClose}><X size={20} /></button></div>
       <IconField label="Full Name" icon={<User size={17} />} value={name} onChange={setName} placeholder="e.g. John Doe" />
       <IconField label="Email Address" icon={<Mail size={17} />} value={email} onChange={setEmail} placeholder="e.g. john@retailflow.com" />
-      <label className="field"><span>Role</span><div className="select-wrap"><select value={role} onChange={(e) => setRole(e.target.value === "Cashier (POS Only)" ? "Cashier" : e.target.value as StaffRole)}><option>Cashier (POS Only)</option><option>Salesperson</option><option>Manager</option><option>Owner</option></select><ChevronDown size={17} /></div></label>
+      <label className="field"><span>Role</span><div className="select-wrap"><select value={role} onChange={(e) => setRole(e.target.value === "Cashier (POS Only)" ? "Cashier" : e.target.value as StaffRole)}><option>Cashier (POS Only)</option><option>Salesperson</option><option>Manager</option><option>Owner</option></select></div></label>
       <IconField label="Password" icon={<Lock size={17} />} value={password} onChange={setPassword} placeholder={staff ? "Leave blank to keep current" : "Min. 8 characters"} type="password" />
       <div className="modal-actions end"><button className="primary" disabled={!valid} onClick={() => valid && onSave({ id: staff?.id ?? crypto.randomUUID(), name, email, role, isCurrent: staff?.isCurrent })}>{staff ? "Update Account" : "Create Account"}</button></div>
     </Modal>
