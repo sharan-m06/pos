@@ -15,6 +15,7 @@
     "@zxing/browser": "^0.2.0",
     "@zxing/library": "^0.22.0",
     "expo": "~54.0.25",
+    "flatpickr": "^4.6.13",
     "jsbarcode": "^3.12.3",
     "lucide-react": "^0.468.0",
     "react": "19.1.0",

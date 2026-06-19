@@ -53,18 +53,25 @@ import {
   YAxis,
 } from "recharts";
 import "./styles.css";
+import DateInput from "./components/DateInput";
 import { generateBarcodeSVG } from "./utils/barcodeGenerator";
 import { getScannerMethod, isMobileBrowser } from "./utils/barcodeScanner";
+import { formatDate, formatDateTime } from "./utils/dateUtils";
 import { generateUniqueBarcode, generateUniqueSKU, isBarcodeUnique, isSKUUnique, isValidEAN13, migrateProductCodes } from "./utils/generateProductCodes";
 import { LabelSize, printLabels } from "./utils/printLabels";
-import { TimeInput } from "./components/ui/TimeInput";
 import type { Supplier } from "./types/supplier";
 import type { POItem, POStatus, PurchaseOrder } from "./types/purchaseOrder";
 import type { ExpenseCategory, PaymentMode } from "./types/expense";
+import type { PurchaseBill, PurchaseBillItem, PurchaseBillPaidVia, PurchaseBillPaymentMode, PurchaseBillPaymentStatus } from "./types/purchaseBill";
+import type { StockMovement } from "./types/stockMovement";
+import type { AccountType, LedgerEntry } from "./types/ledgerEntry";
 import { computePnLFromData } from "./utils/computePnL";
+import { computeBalanceSheetFromData } from "./utils/computeBalanceSheet";
+import { createBillLedgerEntries, createBillPaymentLedgerEntries, createExpenseLedgerEntry, createSaleLedgerEntries } from "./utils/createLedgerEntries";
+import { applyPurchaseBillStock } from "./services/purchaseBillService";
 
 type UnitType = "piece" | "kg" | "meter" | "liter";
-type StaffRole = "Owner" | "Manager" | "Salesperson" | "Cashier";
+type StaffRole = "Owner" | "Manager" | "Cashier" | "Staff";
 type AttendanceStatus = "present" | "absent" | "half-day" | "late" | "leave";
 type BarcodeDetectorResult = { rawValue: string };
 type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => {
@@ -126,6 +133,7 @@ type Invoice = {
   id: string;
   date: string;
   customer: string;
+  customerId?: string;
   items: string;
   total: number;
   gst: number;
@@ -180,6 +188,7 @@ type AuditEvent = {
 };
 
 type Customer = {
+  id: string;
   name: string;
   email: string;
   phone: string;
@@ -235,14 +244,7 @@ const monthlyData = [
 ];
 
 function displayDateTime(date: Date) {
-  return date.toLocaleString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  });
+  return date.toISOString();
 }
 
 function offsetDate(days: number, hours: number, minutes: number) {
@@ -300,6 +302,62 @@ function totalsForPO(items: POItem[]) {
   return { subtotal, totalCGST, totalSGST, totalIGST, totalGST, grandTotal: subtotal + totalGST };
 }
 
+function buildPurchaseBillItem(product: Product, quantity: number, unitCost: number): PurchaseBillItem {
+  const taxable = quantity * unitCost;
+  const gst = taxable * (product.gstRate / 100);
+  return {
+    id: crypto.randomUUID(),
+    productId: product.id,
+    productName: product.name,
+    sku: product.sku,
+    quantity,
+    unit: unitLabel(product.unitType),
+    unitCost,
+    gstRate: product.gstRate,
+    cgst: gst / 2,
+    sgst: gst / 2,
+    igst: 0,
+    lineTotal: taxable + gst,
+    updateStock: true,
+  };
+}
+
+function totalsForPurchaseBill(items: PurchaseBillItem[]) {
+  const subtotal = items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0);
+  const totalCGST = items.reduce((sum, item) => sum + item.cgst, 0);
+  const totalSGST = items.reduce((sum, item) => sum + item.sgst, 0);
+  const totalIGST = items.reduce((sum, item) => sum + item.igst, 0);
+  const totalGST = totalCGST + totalSGST + totalIGST;
+  return { subtotal, totalCGST, totalSGST, totalIGST, totalGST, grandTotal: subtotal + totalGST };
+}
+
+function purchaseBillDisplayStatus(bill: PurchaseBill) {
+  if (bill.balanceDue > 0 && bill.dueDate && new Date(bill.dueDate) < new Date()) return "overdue";
+  if (bill.status === "paid") return "paid";
+  if (bill.status === "partial_paid") return "partial";
+  if (bill.status === "draft") return "draft";
+  return "unpaid";
+}
+
+function purchaseBillStatusLabel(status: string) {
+  return status === "partial" ? "Partial" : status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function createPurchaseBillSummaryLedgerEntry(bill: PurchaseBill): Omit<LedgerEntry, "id" | "balance"> {
+  return {
+    date: bill.billDate,
+    accountType: "purchases",
+    accountName: "Purchase Bills",
+    partyId: bill.supplierId,
+    description: `Purchase Bill - ${bill.supplierName}${bill.supplierInvoiceNo ? ` (Invoice: ${bill.supplierInvoiceNo})` : ""}`,
+    debit: bill.grandTotal,
+    credit: bill.amountPaid,
+    referenceId: bill.billNo,
+    referenceType: "purchase_bill",
+    createdAt: new Date().toISOString(),
+  };
+}
+
 const seedPurchaseOrders: PurchaseOrder[] = (() => {
   const firstItems = [buildPOItem(seedProducts[0], 30, 30, 18), buildPOItem(seedProducts[1], 20, 12, 38)];
   const secondItems = [buildPOItem(seedProducts[2], 12, 0, 66), buildPOItem(seedProducts[4], 10, 0, 92)];
@@ -312,22 +370,23 @@ const seedPurchaseOrders: PurchaseOrder[] = (() => {
 })();
 
 const seedAuditEvents: AuditEvent[] = [
-  { id: "AUD-001", time: "Jun 5, 2026 12:15 PM", user: "Admin Owner", area: "Sales", action: "Created invoice and printed bill", severity: "Info" },
-  { id: "AUD-002", time: "Jun 5, 2026 10:40 AM", user: "Store Manager", area: "Inventory", action: "Updated Sunglasses stock level", severity: "Warning" },
-  { id: "AUD-003", time: "Jun 4, 2026 6:05 PM", user: "Jane Cashier", area: "Payments", action: "Marked invoice INV-0004 as refunded", severity: "Critical" },
-  { id: "AUD-004", time: "Jun 3, 2026 9:30 AM", user: "Admin Owner", area: "Staff", action: "Reviewed cashier access", severity: "Info" },
+  { id: "AUD-001", time: "05/06/2026, 12:15 PM", user: "Admin Owner", area: "Sales", action: "Created invoice and printed bill", severity: "Info" },
+  { id: "AUD-002", time: "05/06/2026, 10:40 AM", user: "Store Manager", area: "Inventory", action: "Updated Sunglasses stock level", severity: "Warning" },
+  { id: "AUD-003", time: "04/06/2026, 6:05 PM", user: "Jane Cashier", area: "Payments", action: "Marked invoice INV-0004 as refunded", severity: "Critical" },
+  { id: "AUD-004", time: "03/06/2026, 9:30 AM", user: "Admin Owner", area: "Staff", action: "Reviewed cashier access", severity: "Info" },
 ];
 
 const seedCustomers: Customer[] = [
-  { name: "Alice Johnson", email: "alice@example.com", phone: "555-0101", spent: 1250.5, lastVisit: "10/15/2023" },
-  { name: "Bob Smith", email: "bob@example.com", phone: "555-0102", spent: 450, lastVisit: "10/20/2023" },
-  { name: "Charlie Brown", email: "charlie@example.com", phone: "555-0103", spent: 89.99, lastVisit: "10/22/2023" },
+  { id: "c1", name: "Alice Johnson", email: "alice@example.com", phone: "555-0101", spent: 1250.5, lastVisit: "15/10/2023" },
+  { id: "c2", name: "Bob Smith", email: "bob@example.com", phone: "555-0102", spent: 450, lastVisit: "20/10/2023" },
+  { id: "c3", name: "Charlie Brown", email: "charlie@example.com", phone: "555-0103", spent: 89.99, lastVisit: "22/10/2023" },
 ];
 
 const seedStaff: Staff[] = [
   { id: "s1", name: "Admin Owner", email: "owner@retailflow.com", role: "Owner", isCurrent: true },
   { id: "s2", name: "Store Manager", email: "manager@retailflow.com", role: "Manager" },
   { id: "s3", name: "Jane Cashier", email: "cashier@retailflow.com", role: "Cashier" },
+  { id: "s4", name: "Floor Staff", email: "staff@retailflow.com", role: "Staff" },
 ];
 
 type AppState = {
@@ -341,7 +400,14 @@ type AppState = {
   setSuppliers: React.Dispatch<React.SetStateAction<Supplier[]>>;
   purchaseOrders: PurchaseOrder[];
   setPurchaseOrders: React.Dispatch<React.SetStateAction<PurchaseOrder[]>>;
+  purchaseBills: PurchaseBill[];
+  setPurchaseBills: React.Dispatch<React.SetStateAction<PurchaseBill[]>>;
+  stockMovements: StockMovement[];
+  setStockMovements: React.Dispatch<React.SetStateAction<StockMovement[]>>;
+  ledgerEntries: LedgerEntry[];
+  setLedgerEntries: React.Dispatch<React.SetStateAction<LedgerEntry[]>>;
   customers: Customer[];
+  setCustomers: React.Dispatch<React.SetStateAction<Customer[]>>;
   staff: Staff[];
   setStaff: React.Dispatch<React.SetStateAction<Staff[]>>;
   attendance: AttendanceRecord[];
@@ -378,6 +444,17 @@ function receiptMoney(value: number) {
   return `Rs ${value.toFixed(2)}`;
 }
 
+function downloadCSV(filename: string, rows: Array<Record<string, string | number>>) {
+  const headers = Object.keys(rows[0] ?? { Date: "", Description: "", Reference: "", Debit: "", Credit: "", Balance: "" });
+  const csv = [headers.join(","), ...rows.map((row) => headers.map((header) => `"${String(row[header] ?? "").replace(/"/g, '""')}"`).join(","))].join("\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 function buildThermalReceipt(invoice: Invoice) {
   const lines = invoice.lines ?? [];
   const subtotal = lines.reduce((sum, line) => sum + amountForLine(line).base, 0);
@@ -396,7 +473,7 @@ function buildThermalReceipt(invoice: Invoice) {
     "           Tax Invoice",
     "--------------------------------",
     `Invoice : ${invoice.id}`,
-    `Date    : ${invoice.date}`,
+    `Date    : ${formatDateTime(invoice.date)}`,
     `Customer: ${invoice.customer}`,
     `Payment : ${invoice.payment}`,
     "--------------------------------",
@@ -551,13 +628,6 @@ function hoursLabel(checkIn?: string, checkOut?: string) {
   return hours === undefined ? "Invalid" : `${hours} hrs`;
 }
 
-function amPm(time?: string) {
-  if (!time) return "";
-  const hour = Number(time.split(":")[0]);
-  if (Number.isNaN(hour)) return "";
-  return hour < 12 ? "AM" : "PM";
-}
-
 function statusLabel(status: AttendanceStatus) {
   return status === "half-day" ? "Half Day" : status === "late" ? "Late" : status === "leave" ? "Leave" : status === "absent" ? "Absent" : "Present";
 }
@@ -570,14 +640,14 @@ function staffInitials(name: string) {
   return name.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 }
 
-function salesCsv(invoices: Invoice[]) {
+function salesCsv(invoices: Invoice[], products: Product[]) {
   const headers = ["Invoice", "Date", "Customer", "Items", "Total", "GST", "Payment", "Status", "Staff"];
   const rows = invoices.map((invoice) => [
     invoice.id,
-    invoice.date,
+    formatDateTime(invoice.date),
     invoice.customer,
     invoice.items,
-    invoice.total.toFixed(2),
+    invoiceDisplayTotal(invoice, products).toFixed(2),
     invoice.gst.toFixed(2),
     invoice.payment,
     invoice.status,
@@ -586,14 +656,14 @@ function salesCsv(invoices: Invoice[]) {
   return [headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
 }
 
-function salesPdfHtml(invoices: Invoice[]) {
+function salesPdfHtml(invoices: Invoice[], products: Product[]) {
   const rows = invoices.map((invoice) => `
     <tr>
       <td>${escapeHtml(invoice.id)}</td>
-      <td>${escapeHtml(invoice.date)}</td>
+      <td>${escapeHtml(formatDateTime(invoice.date))}</td>
       <td>${escapeHtml(invoice.customer)}</td>
       <td>${escapeHtml(invoice.items)}</td>
-      <td class="num">${escapeHtml(INR.format(invoice.total))}</td>
+      <td class="num">${escapeHtml(INR.format(invoiceDisplayTotal(invoice, products)))}</td>
       <td class="num">${escapeHtml(INR.format(invoice.gst))}</td>
       <td>${escapeHtml(invoice.payment)}</td>
       <td>${escapeHtml(invoice.status)}</td>
@@ -617,7 +687,7 @@ function salesPdfHtml(invoices: Invoice[]) {
       </head>
       <body>
         <h1>Sales History</h1>
-        <p>${invoices.length} invoice${invoices.length === 1 ? "" : "s"} exported on ${escapeHtml(longDate())}.</p>
+        <p>${invoices.length} invoice${invoices.length === 1 ? "" : "s"} exported on ${escapeHtml(formatDate(new Date()))}.</p>
         <table>
           <thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Items</th><th>Total</th><th>GST</th><th>Payment</th><th>Status</th><th>Staff</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="9">No invoices found.</td></tr>'}</tbody>
@@ -646,8 +716,18 @@ function lineQuantityLabel(line: OrderLine) {
   return `${line.qty} ${unitLabel(line.product.unitType)}`;
 }
 
+function orderLineQuantity(line: OrderLine) {
+  return line.type === "fabric" ? line.pieces : line.qty;
+}
+
+function lineUnitSuffix(line: OrderLine) {
+  if (line.type === "fabric") return line.unit;
+  return line.product.unitType === "piece" ? "pc" : line.product.unitType === "meter" ? "m" : line.product.unitType === "liter" ? "L" : "kg";
+}
+
 function linePriceLabel(line: OrderLine) {
-  return `${lineQuantityLabel(line)} • ${INR.format(line.product.price)}`;
+  const gstNote = line.product.gstRate > 0 ? " (incl. GST)" : "";
+  return `${lineQuantityLabel(line)} • ${INR.format(amountForProduct(line.product).total)}/${lineUnitSuffix(line)}${gstNote}`;
 }
 
 function isReturnedLine(line: EditableOrderLine) {
@@ -690,30 +770,63 @@ function legacyInvoiceLines(invoice: Invoice, products: Product[]): OrderLine[] 
   return linesByInvoice[invoice.id] ?? [];
 }
 
+function invoiceDisplayTotal(invoice: Invoice, products: Product[]) {
+  const lines = legacyInvoiceLines(invoice, products);
+  return lines.length ? summarizeInvoiceLines(lines, invoice.discount ?? 0).total : invoice.total;
+}
+
+function entriesWithRunningBalance(existing: LedgerEntry[], entries: Array<Omit<LedgerEntry, "id" | "balance">>) {
+  return entries.reduce<LedgerEntry[]>((all, entry) => {
+    const balance = all.filter((item) => item.accountType === entry.accountType).reduce((sum, item) => sum + item.debit - item.credit, 0) + entry.debit - entry.credit;
+    return [{ ...entry, id: `LED-${String(Date.now()).slice(-6)}-${all.length + 1}`, balance }, ...all];
+  }, existing);
+}
+
 function roleAccess(role: StaffRole) {
+  const isOwner = role === "Owner";
+  const isManager = role === "Manager";
+  const isCashier = role === "Cashier";
   return {
-    canUsePos: ["Owner", "Manager", "Salesperson", "Cashier"].includes(role),
-    canViewSales: ["Owner", "Manager", "Salesperson", "Cashier"].includes(role),
-    canEditInvoice: role === "Owner" || role === "Manager",
-    canDeleteInvoice: role === "Owner",
-    canExportSales: role === "Owner" || role === "Manager",
-    canManageInventory: role === "Owner" || role === "Manager",
-    canManageProcurement: role === "Owner" || role === "Manager",
-    canViewExpenses: role === "Owner" || role === "Manager",
-    canViewPnL: role === "Owner",
-    canViewReports: role === "Owner" || role === "Manager",
-    canViewPerformance: role === "Owner",
-    canManageStaff: role === "Owner",
+    canViewDashboard: isOwner,
+    canUsePos: true,
+    canViewSales: isOwner || isManager || isCashier,
+    canViewSalesTotals: isOwner,
+    canEditInvoice: isOwner || isManager,
+    canDeleteInvoice: isOwner,
+    canExportSales: isOwner,
+    canManageInventory: isOwner || isManager,
+    canDeleteProducts: isOwner,
+    canManageProcurement: isOwner || isManager,
+    canManagePurchaseBills: isOwner || isManager,
+    canDeleteSuppliers: isOwner,
+    canManageCustomers: isOwner || isManager,
+    canViewExpenses: isOwner,
+    canViewPnL: isOwner,
+    canViewBalanceSheet: isOwner,
+    canViewLedger: isOwner,
+    canViewReports: isOwner,
+    canViewPerformance: isOwner,
+    canManageStaff: isOwner,
+    salesScope: isCashier ? "own" : "all",
   };
 }
 
+function defaultRouteForRole(role: StaffRole) {
+  return role === "Owner" ? "/dashboard" : "/pos";
+}
+
 function AppProvider({ children }: { children: React.ReactNode }) {
+  const savedSessionEmail = typeof localStorage !== "undefined" ? localStorage.getItem("retailflow-user-email") : null;
   const [products, setProducts] = useState(seedProducts);
   const [invoices, setInvoices] = useState(seedInvoices);
   const [expenses, setExpenses] = useState(seedExpenses);
   const [suppliers, setSuppliers] = useState(seedSuppliers);
   const [purchaseOrders, setPurchaseOrders] = useState(seedPurchaseOrders);
-  const [staff, setStaff] = useState(seedStaff);
+  const [purchaseBills, setPurchaseBills] = useState<PurchaseBill[]>([]);
+  const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
+  const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
+  const [customers, setCustomers] = useState(seedCustomers);
+  const [staff, setStaff] = useState(() => savedSessionEmail ? seedStaff.map((member) => ({ ...member, isCurrent: member.email.toLowerCase() === savedSessionEmail })) : seedStaff);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [order, setOrder] = useState<OrderLine[]>([]);
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -723,8 +836,8 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   const value = useMemo(
-    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, customers: seedCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, toast, showToast }),
-    [products, invoices, expenses, suppliers, purchaseOrders, staff, attendance, order, toast],
+    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, purchaseBills, setPurchaseBills, stockMovements, setStockMovements, ledgerEntries, setLedgerEntries, customers, setCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, toast, showToast }),
+    [products, invoices, expenses, suppliers, purchaseOrders, purchaseBills, stockMovements, ledgerEntries, customers, staff, attendance, order, toast],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -756,6 +869,8 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
   const credentials: Array<[string, string]> = [
     ["owner@retailflow.com", "password"],
     ["manager@retailflow.com", "password"],
+    ["cashier@retailflow.com", "password"],
+    ["staff@retailflow.com", "password"],
   ];
   const savedUsers = (): Array<{ name: string; email: string; password: string }> => {
     try {
@@ -789,8 +904,9 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
         return;
       }
       localStorage.setItem("retailflow-signups", JSON.stringify([...users, { name: trimmedName, email: normalizedEmail, password }]));
-      setStaff((items) => [...items, { id: crypto.randomUUID(), name: trimmedName, email: normalizedEmail, role: "Owner" }]);
+      setStaff((items) => [...items.map((member) => ({ ...member, isCurrent: false })), { id: crypto.randomUUID(), name: trimmedName, email: normalizedEmail, role: "Owner", isCurrent: true }]);
       localStorage.setItem("retailflow-auth", "true");
+      localStorage.setItem("retailflow-user-email", normalizedEmail);
       onLogin();
       navigate("/dashboard");
       return;
@@ -798,9 +914,17 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
 
     const users = savedUsers();
     if (credentials.some(([u, p]) => u === normalizedEmail && p === password) || users.some((user) => user.email === normalizedEmail && user.password === password)) {
+      setStaff((items) => {
+        const next = items.map((member) => ({ ...member, isCurrent: member.email.toLowerCase() === normalizedEmail }));
+        if (next.some((member) => member.isCurrent)) return next;
+        const savedUser = users.find((user) => user.email === normalizedEmail);
+        return [...next, { id: crypto.randomUUID(), name: savedUser?.name ?? normalizedEmail, email: normalizedEmail, role: "Owner", isCurrent: true }];
+      });
       localStorage.setItem("retailflow-auth", "true");
+      localStorage.setItem("retailflow-user-email", normalizedEmail);
       onLogin();
-      navigate("/dashboard");
+      const member = seedStaff.find((item) => item.email.toLowerCase() === normalizedEmail);
+      navigate(defaultRouteForRole(member?.role ?? "Owner"));
       return;
     }
     setError("Use the demo credentials or a signed-up account.");
@@ -831,6 +955,8 @@ function LoginPage({ onLogin }: { onLogin: () => void }) {
             <strong>Demo credentials</strong>
             <span>Owner: owner@retailflow.com / password</span>
             <span>Manager: manager@retailflow.com / password</span>
+            <span>Cashier: cashier@retailflow.com / password</span>
+            <span>Staff: staff@retailflow.com / password</span>
           </div>}
         </form>
       </section>
@@ -847,23 +973,44 @@ function LabeledInput({ icon, value, onChange, placeholder, type = "text" }: { i
   );
 }
 
+function useHashTab<T extends string>(allowed: readonly T[], fallback: T) {
+  const read = () => {
+    const value = window.location.hash.replace("#", "") as T;
+    return allowed.includes(value) ? value : fallback;
+  };
+  const [tab, setTab] = useState<T>(read);
+  useEffect(() => {
+    const onHash = () => setTab(read());
+    window.addEventListener("hashchange", onHash);
+    onHash();
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const selectTab = (next: T) => {
+    if (window.location.hash !== `#${next}`) window.history.replaceState(null, "", `${window.location.pathname}#${next}`);
+    setTab(next);
+  };
+  return [tab, selectTab] as const;
+}
+
 function Shell({ onSignOut }: { onSignOut: () => void }) {
   const { toast, staff } = useApp();
   const location = useLocation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => (typeof localStorage !== "undefined" ? localStorage.getItem("sidebarCollapsed") === "true" : false));
   const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
   const access = roleAccess(currentUser.role);
-  const navItems = [
-    { path: "/dashboard", label: "Dashboard", icon: <BarChart3 size={17} />, allowed: true },
+  const defaultRoute = defaultRouteForRole(currentUser.role);
+  const navItems: Array<{ type?: "section"; label: string; path?: string; icon?: React.ReactNode; allowed: boolean }> = [
+    { path: "/dashboard", label: "Dashboard", icon: <BarChart3 size={17} />, allowed: access.canViewDashboard },
     { path: "/pos", label: "Point of Sale", icon: <ShoppingCart size={17} />, allowed: access.canUsePos },
     { path: "/sales", label: "Sales History", icon: <IndianRupee size={17} />, allowed: access.canViewSales },
     { path: "/products", label: "Inventory", icon: <Box size={17} />, allowed: access.canManageInventory },
-    { path: "/suppliers", label: "Suppliers", icon: <Truck size={17} />, allowed: access.canManageProcurement },
-    { path: "/purchase-orders", label: "Purchase Orders", icon: <ClipboardList size={17} />, allowed: access.canManageProcurement },
-    { path: "/customers", label: "Customers", icon: <Users size={17} />, allowed: true },
+    { type: "section", label: "Procurement", allowed: access.canManageProcurement },
+    { path: "/procurement#suppliers", label: "Procurement", icon: <Truck size={17} />, allowed: access.canManageProcurement },
+    { path: "/customers", label: "Customers", icon: <Users size={17} />, allowed: access.canManageCustomers },
+    { type: "section", label: "Finance", allowed: access.canViewReports || access.canViewExpenses || access.canViewPnL },
     { path: "/reports", label: "Reports", icon: <BarChart3 size={17} />, allowed: access.canViewReports },
     { path: "/expenses", label: "Expenses", icon: <IndianRupee size={17} />, allowed: access.canViewExpenses },
-    { path: "/reports/pnl", label: "P&L Report", icon: <TrendingUp size={17} />, allowed: access.canViewPnL },
+    { path: "/financials#balance-sheet", label: "Financials", icon: <TrendingUp size={17} />, allowed: access.canViewPnL || access.canViewBalanceSheet || access.canViewLedger },
     { path: "/performance", label: "Performance", icon: <BarChart3 size={17} />, allowed: access.canViewPerformance },
     { path: "/staff", label: "Staff", icon: <User size={17} />, allowed: access.canManageStaff },
   ];
@@ -885,7 +1032,9 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
         </div>
         <nav>
           {navItems.filter((item) => item.allowed).map((item) => (
-            <NavLink key={item.path} end={item.path === "/reports"} title={sidebarCollapsed ? item.label : undefined} className={({ isActive }) => `nav-row ${isActive ? "active" : ""}`} to={item.path}>{item.icon}{!sidebarCollapsed ? <span>{item.label}</span> : null}</NavLink>
+            item.type === "section"
+              ? <div className="nav-section-label" key={`section-${item.label}`}>{item.label}</div>
+              : <NavLink key={item.path} end={item.path === "/reports"} title={sidebarCollapsed ? item.label : undefined} className={({ isActive }) => `nav-row ${isActive ? "active" : ""}`} to={item.path ?? "/"}>{item.icon}{!sidebarCollapsed ? <span>{item.label}</span> : null}</NavLink>
           ))}
         </nav>
         <div className="sidebar-user">
@@ -896,27 +1045,33 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
           className="signout"
           onClick={() => {
             localStorage.removeItem("retailflow-auth");
+            localStorage.removeItem("retailflow-user-email");
             onSignOut();
           }}
           title={sidebarCollapsed ? "Sign Out" : undefined}
         ><LogOut size={17} />{!sidebarCollapsed ? <span>Sign Out</span> : null}</button>
       </aside>
       <main className={`content ${location.pathname === "/pos" ? "pos-screen" : ""}`}>
-        {location.pathname === "/" ? <Navigate to="/dashboard" replace /> : (
+        {location.pathname === "/" ? <Navigate to={defaultRoute} replace /> : (
           <Routes>
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/pos" element={access.canUsePos ? <POS /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/sales" element={access.canViewSales ? <Sales /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/products" element={access.canManageInventory ? <Inventory /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/suppliers" element={access.canManageProcurement ? <SuppliersScreen /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/purchase-orders" element={access.canManageProcurement ? <PurchaseOrdersScreen /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/customers" element={<Customers />} />
-            <Route path="/reports" element={access.canViewReports ? <Reports /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/expenses" element={access.canViewExpenses ? <ExpensesScreen /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/reports/pnl" element={access.canViewPnL ? <PnLScreen /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/performance" element={access.canViewPerformance ? <Performance /> : <Navigate to="/dashboard" replace />} />
-            <Route path="/staff" element={access.canManageStaff ? <StaffPage /> : <Navigate to="/dashboard" replace />} />
-            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={access.canViewDashboard ? <Dashboard /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/pos" element={access.canUsePos ? <POS /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/sales" element={access.canViewSales ? <Sales /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/products" element={access.canManageInventory ? <Inventory /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/procurement" element={access.canManageProcurement ? <ProcurementScreen /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/suppliers" element={<Navigate to="/procurement#suppliers" replace />} />
+            <Route path="/purchase-orders" element={<Navigate to="/procurement#purchase-orders" replace />} />
+            <Route path="/purchase-bills" element={<Navigate to="/procurement#purchase-bills" replace />} />
+            <Route path="/customers" element={access.canManageCustomers ? <Customers /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/reports" element={access.canViewReports ? <Reports /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/expenses" element={access.canViewExpenses ? <ExpensesScreen /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/financials" element={(access.canViewPnL || access.canViewBalanceSheet || access.canViewLedger) ? <FinancialsScreen /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/reports/pnl" element={<Navigate to="/financials#pl" replace />} />
+            <Route path="/reports/balance-sheet" element={<Navigate to="/financials#balance-sheet" replace />} />
+            <Route path="/reports/ledger" element={<Navigate to="/financials#ledger" replace />} />
+            <Route path="/performance" element={access.canViewPerformance ? <Performance /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/staff" element={access.canManageStaff ? <StaffPage /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="*" element={<Navigate to={defaultRoute} replace />} />
           </Routes>
         )}
       </main>
@@ -1004,7 +1159,8 @@ function GSTPill({ rate }: { rate: number }) {
 }
 
 function POS() {
-  const { products, order, setOrder, setInvoices, staff, showToast } = useApp();
+  const { products, setProducts, order, setOrder, setInvoices, setStockMovements, setLedgerEntries, customers, setCustomers, staff, showToast } = useApp();
+  const location = useLocation();
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [category, setCategory] = useState("All");
@@ -1018,10 +1174,19 @@ function POS() {
   const [selectedSalespersonId, setSelectedSalespersonId] = useState(currentUser?.id ?? "");
   const selectedSalesperson = salespersonOptions.find((member) => member.id === selectedSalespersonId) ?? null;
   const [salespersonTouched, setSalespersonTouched] = useState(false);
+  const initialCustomerId = (location.state as { customerId?: string } | null)?.customerId ?? "";
+  const initialCustomer = customers.find((customer) => customer.id === initialCustomerId) ?? null;
+  const [selectedCustomerId, setSelectedCustomerId] = useState(initialCustomer?.id ?? "");
+  const [customerQuery, setCustomerQuery] = useState(initialCustomer?.name ?? "Walk-in");
+  const [customerDropdownOpen, setCustomerDropdownOpen] = useState(false);
   const barcodeInputRef = useRef<HTMLInputElement | null>(null);
   const prewarmedStreamRef = useRef<MediaStream | null>(null);
   const categories = ["All", "Apparel", "Footwear", "Accessories", "Groceries", "Electronics"];
   const filtered = products.filter((p) => (category === "All" || p.category === category) && `${p.name} ${p.sku} ${p.barcode ?? ""}`.toLowerCase().includes(search.toLowerCase()));
+  const orderQuantity = order.reduce((sum, line) => sum + orderLineQuantity(line), 0);
+  const productOverviewText = search.trim()
+    ? `Showing ${filtered.length} product${filtered.length === 1 ? "" : "s"} matching '${search.trim()}'`
+    : `Showing ${filtered.length} product${filtered.length === 1 ? "" : "s"}`;
   const totals = order.reduce((acc, line) => {
     const amount = amountForLine(line);
     acc.base += amount.base;
@@ -1031,6 +1196,35 @@ function POS() {
   }, { base: 0, gst: 0, total: 0 });
   const normalizeBarcode = (value: string) => value.trim().toLowerCase().replace(/[\s-]/g, "");
   const canCharge = order.length > 0 && selectedSalesperson !== null;
+  const selectedCustomer = customers.find((customer) => customer.id === selectedCustomerId) ?? null;
+  const customerSearch = customerQuery.trim().toLowerCase();
+  const customerMatches = customerSearch && customerSearch !== "walk-in"
+    ? customers.filter((customer) => `${customer.name} ${customer.phone}`.toLowerCase().includes(customerSearch)).slice(0, 5)
+    : customers.slice(0, 5);
+
+  useEffect(() => {
+    const stateCustomerId = (location.state as { customerId?: string } | null)?.customerId;
+    if (!stateCustomerId) return;
+    const customer = customers.find((item) => item.id === stateCustomerId);
+    if (!customer) return;
+    setSelectedCustomerId(customer.id);
+    setCustomerQuery(customer.name);
+  }, [location.state, customers]);
+
+  function choosePosCustomer(customer: Customer | null) {
+    setSelectedCustomerId(customer?.id ?? "");
+    setCustomerQuery(customer?.name ?? "Walk-in");
+    setCustomerDropdownOpen(false);
+  }
+
+  function addInlinePosCustomer() {
+    const name = customerQuery.trim();
+    if (!name || name.toLowerCase() === "walk-in") return;
+    const customer: Customer = { id: crypto.randomUUID(), name, email: "", phone: "", spent: 0, lastVisit: "-" };
+    setCustomers((items) => [customer, ...items]);
+    choosePosCustomer(customer);
+    showToast("Customer added successfully");
+  }
 
   function addProduct(product: Product, source: "click" | "scan" = "click") {
     if (product.unitType === "meter" && source === "click") {
@@ -1126,15 +1320,17 @@ function POS() {
     };
   }, []);
 
-  async function completePayment(customerName: string, paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) {
+  async function completePayment(paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) {
     if (!order.length || !selectedSalesperson) {
       setSalespersonTouched(true);
       return;
     }
+    const invoiceCustomer = selectedCustomer?.name ?? "Walk-in";
     const invoice: Invoice = {
       id: `INV-${String(Date.now()).slice(-4)}`,
       date: displayDateTime(new Date()),
-      customer: customerName.trim() || "Walk-in",
+      customer: invoiceCustomer,
+      customerId: selectedCustomer?.id,
       items: `${order.length} items`,
       total: payableTotal,
       discount: discountAmount,
@@ -1147,8 +1343,34 @@ function POS() {
       lines: order,
     };
     setInvoices((items) => [invoice, ...items]);
+    setProducts((items) => items.map((product) => {
+      const soldQty = order.filter((line) => line.product.id === product.id).reduce((sum, line) => sum + (line.type === "fabric" ? line.totalMeters : line.qty), 0);
+      return soldQty ? { ...product, stock: Math.max(0, product.stock - soldQty) } : product;
+    }));
+    setStockMovements((items) => [
+      ...order.map((line) => {
+        const soldQty = line.type === "fabric" ? line.totalMeters : line.qty;
+        const product = products.find((item) => item.id === line.product.id) ?? line.product;
+        return {
+          id: `SM-${invoice.id}-${line.id}`,
+          productId: product.id,
+          productName: product.name,
+          type: "sale" as const,
+          quantity: -soldQty,
+          balanceAfter: Math.max(0, product.stock - soldQty),
+          referenceId: invoice.id,
+          referenceType: "sale" as const,
+          date: new Date().toISOString(),
+          notes: `Sale ${invoice.id}`,
+          createdBy: selectedSalesperson.name,
+        };
+      }),
+      ...items,
+    ]);
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createSaleLedgerEntries(invoice)));
     setOrder([]);
     setPaymentOpen(false);
+    choosePosCustomer(null);
     setSelectedSalespersonId(currentUser?.id ?? selectedSalesperson.id);
     setSalespersonTouched(false);
     const printed = await printInvoice(invoice);
@@ -1181,7 +1403,11 @@ function POS() {
       <div className="pos-layout" style={{ "--order-width": `${orderWidth}px` } as React.CSSProperties}>
       <div className="pos-products">
         <div className={`pos-sticky-header ${isProductGridScrolled ? "scrolled" : ""}`}>
-          <div className="pos-head pos-control-row">
+          <div className="pos-action-row">
+            <label className="searchbox"><Search size={15} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products or SKU..." /></label>
+            <form className="scanbox" onSubmit={scanBarcode}><div className="scan-input-wrap"><ScanBarcode size={15} /><input ref={barcodeInputRef} value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode / SKU to add directly" /></div><button type="submit">Scan</button></form>
+          </div>
+          <div className="pos-selector-row">
             <div className="salesperson-row">
               <label htmlFor="salesperson-select"><User size={16} /> Salesperson:</label>
               <select id="salesperson-select" value={selectedSalespersonId} onChange={(event) => { setSelectedSalespersonId(event.target.value); setSalespersonTouched(true); }}>
@@ -1189,27 +1415,50 @@ function POS() {
                 {salespersonOptions.map((member) => <option key={member.id} value={member.id}>{member.name} · {member.role}</option>)}
               </select>
             </div>
-            <label className="searchbox"><Search size={17} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products or SKU..." /></label>
+            <div className="salesperson-row pos-customer-row">
+              <label htmlFor="pos-customer-input"><Users size={16} /> Customer:</label>
+              <div className="pos-customer-picker pos-customer-combobox">
+                <input
+                  id="pos-customer-input"
+                  value={customerQuery}
+                  onFocus={() => setCustomerDropdownOpen(true)}
+                  onBlur={() => window.setTimeout(() => setCustomerDropdownOpen(false), 120)}
+                  onChange={(event) => { setCustomerQuery(event.target.value); setSelectedCustomerId(""); setCustomerDropdownOpen(true); }}
+                  placeholder="Walk-in or search customer"
+                />
+                {customerDropdownOpen ? (
+                  <div className="pos-customer-dropdown">
+                    <button type="button" className={!selectedCustomer ? "active" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => choosePosCustomer(null)}>Walk-in</button>
+                    {customerMatches.map((customer) => <button type="button" key={customer.id} className={selectedCustomerId === customer.id ? "active" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => choosePosCustomer(customer)}>{customer.name}{customer.phone ? ` · ${customer.phone}` : ""}</button>)}
+                    {customerQuery.trim() && customerQuery.trim().toLowerCase() !== "walk-in" && !selectedCustomer ? <button type="button" className="add-new" onMouseDown={(event) => event.preventDefault()} onClick={addInlinePosCustomer}>+ Add New Customer</button> : null}
+                  </div>
+                ) : null}
+              </div>
+            </div>
           </div>
-          <form className="scanbox" onSubmit={scanBarcode}><ScanBarcode size={18} /><input ref={barcodeInputRef} value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode / SKU to add directly" /><button type="submit">Scan</button></form>
           {salespersonTouched && !selectedSalesperson ? <div className="salesperson-warning">Please select a salesperson to continue</div> : null}
           <div className="category-row"><button className="arrow-btn"><ChevronLeft size={16} /></button><div className="category-pills">{categories.map((c) => <button key={c} className={`chip ${category === c ? "active" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}</div><button className="arrow-btn"><ChevronRight size={16} /></button></div>
         </div>
         <div className="product-scroll-area" onScroll={(event) => setIsProductGridScrolled(event.currentTarget.scrollTop > 10)}>
+          <div className="product-overview">
+            <span>{productOverviewText}</span>
+            {category !== "All" ? <strong>{category}</strong> : null}
+          </div>
           <div className="product-grid">
-            {filtered.map((product) => (
+            {filtered.length ? filtered.map((product) => (
               <ProductCard key={product.id} product={product} onClick={() => addProduct(product)} />
-            ))}
+            )) : <div className="empty compact">No Data Available</div>}
           </div>
         </div>
       </div>
       <div className="order-resizer" title="Drag to resize current order" onMouseDown={startOrderResize} />
       <aside className="order-panel">
-        <div className="order-head"><h2>Current Order</h2><button className="danger-light" onClick={() => setOrder([])}><Trash2 size={16} />Clear</button></div>
+        <div className="order-head"><div className="order-title-wrap"><h2>Current Order</h2>{order.length > 0 ? <span className="order-count-badge">{orderQuantity} item{orderQuantity === 1 ? "" : "s"}</span> : null}</div><button className="danger-light" onClick={() => setOrder([])}><Trash2 size={16} />Clear</button></div>
         <div className="order-lines">
-          {order.length === 0 ? <div className="empty pos-empty"><ShoppingBag size={40} /><span>Click products to build an order.</span></div> : order.map((line) => <OrderLineRow key={line.id} line={line} />)}
+          {order.length === 0 ? <div className="empty-order-state"><div className="empty-order-box"><ShoppingBag size={40} /><strong>No items yet</strong><span>Tap a product to add it to this order</span></div></div> : order.map((line) => <OrderLineRow key={line.id} line={line} />)}
         </div>
         <div className="totals">
+          <div className="total-items-row"><span>Total Items</span><strong>{orderQuantity} ({order.length} product{order.length === 1 ? "" : "s"})</strong></div>
           <div><span>Subtotal:</span><strong>{INR.format(totals.base)}</strong></div>
           <div><span>Total GST:</span><strong>{INR.format(totals.gst)}</strong></div>
           <hr />
@@ -1218,7 +1467,7 @@ function POS() {
         <button className="primary full charge" disabled={!order.length} onClick={() => canCharge ? setPaymentOpen(true) : setSalespersonTouched(true)}>Charge {INR.format(totals.total)}</button>
       </aside>
       {fabricProduct && <FabricModal product={fabricProduct} onClose={() => setFabricProduct(null)} />}
-      {paymentOpen && <PaymentModal total={totals.total} onClose={() => setPaymentOpen(false)} onConfirm={completePayment} />}
+      {paymentOpen && <PaymentModal total={totals.total} itemCount={orderQuantity} productCount={order.length} onClose={() => setPaymentOpen(false)} onConfirm={completePayment} />}
       <BarcodeScannerModal visible={scannerOpen} prewarmedStream={prewarmedStreamRef.current} onClose={() => { setScannerOpen(false); prewarmedStreamRef.current = null; }} onManual={() => { setScannerOpen(false); prewarmedStreamRef.current = null; barcodeInputRef.current?.focus(); }} onScanned={handleScannerCode} />
       </div>
     </section>
@@ -1462,8 +1711,7 @@ function OrderLineRow({ line }: { line: OrderLine }) {
   );
 }
 
-function PaymentModal({ total, onClose, onConfirm }: { total: number; onClose: () => void; onConfirm: (customerName: string, paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) => void | Promise<void> }) {
-  const [customerName, setCustomerName] = useState("");
+function PaymentModal({ total, itemCount, productCount, onClose, onConfirm }: { total: number; itemCount: number; productCount: number; onClose: () => void; onConfirm: (paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) => void | Promise<void> }) {
   const [method, setMethod] = useState<PaymentMethod>("Card");
   const [discountDraft, setDiscountDraft] = useState("");
   const [discountMode, setDiscountMode] = useState<"percent" | "amount">("percent");
@@ -1481,13 +1729,10 @@ function PaymentModal({ total, onClose, onConfirm }: { total: number; onClose: (
         <div>
           <h2>Complete Payment</h2>
           <p>Total Amount: <strong>{INR.format(payableTotal)}</strong></p>
+          <small className="payment-item-count">{itemCount} item{itemCount === 1 ? "" : "s"} · {productCount} product{productCount === 1 ? "" : "s"}</small>
         </div>
         <button onClick={onClose}><X size={20} /></button>
       </div>
-      <label className="field">
-        <span>Customer Name (Optional)</span>
-        <input autoFocus value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Enter customer name" />
-      </label>
       <div className="payment-discount">
         <div className="payment-summary-row"><span>Order Total</span><strong>{INR.format(total)}</strong></div>
         <div className="discount-control">
@@ -1516,7 +1761,7 @@ function PaymentModal({ total, onClose, onConfirm }: { total: number; onClose: (
           {cashShort && <small>Received cash must be at least {INR.format(payableTotal)}.</small>}
         </div>
       )}
-      <button className="primary full" disabled={cashShort} onClick={() => onConfirm(customerName, method, payableTotal, discountAmount)}>
+      <button className="primary full" disabled={cashShort} onClick={() => onConfirm(method, payableTotal, discountAmount)}>
         Confirm {method} Payment
       </button>
     </Modal>
@@ -1573,10 +1818,11 @@ function Sales() {
       `${invoice.id} ${invoice.customer} ${invoice.staff} ${invoice.salespersonName}`.toLowerCase().includes(query.toLowerCase()) &&
       (method === "All Methods" || invoice.payment === method) &&
       (staffFilter === "All Staff" || invoice.staff === staffFilter) &&
-      (!dateFilter || dateKey(invoice.date) === dateFilter)
+      (!dateFilter || dateKey(invoice.date) === dateFilter) &&
+      (access.salesScope !== "own" || invoice.salespersonId === currentUser.id || invoice.staff === currentUser.name || invoice.salespersonName === currentUser.name)
     )
     .sort((a, b) => invoiceTime(b) - invoiceTime(a));
-  const filteredTotal = filtered.reduce((sum, invoice) => sum + invoice.total, 0);
+  const filteredTotal = filtered.reduce((sum, invoice) => sum + invoiceDisplayTotal(invoice, products), 0);
   const deleteInvoice = (invoice: Invoice) => {
     if (!access.canDeleteInvoice) return;
     if (window.confirm(`Delete invoice ${invoice.id}? This action cannot be undone.`)) {
@@ -1586,7 +1832,7 @@ function Sales() {
   const exportRows = (format: "csv" | "pdf") => {
     const stamp = dateFilter || dateKey(new Date().toISOString()) || "sales";
     if (format === "csv") {
-      downloadFile(`sales-history-${stamp}.csv`, `\uFEFF${salesCsv(filtered)}`, "text/csv;charset=utf-8");
+      downloadFile(`sales-history-${stamp}.csv`, `\uFEFF${salesCsv(filtered, products)}`, "text/csv;charset=utf-8");
       setExportOpen(false);
       return;
     }
@@ -1596,25 +1842,25 @@ function Sales() {
       window.alert("Please allow pop-ups to export PDF.");
       return;
     }
-    win.document.write(salesPdfHtml(filtered));
+    win.document.write(salesPdfHtml(filtered, products));
     win.document.close();
     win.focus();
     win.print();
     setExportOpen(false);
   };
   return (
-    <section className="page">
-      <PageHeader title="Sales History" subtitle="View and manage transaction records." action={access.canExportSales ? <button className="outline" onClick={() => setExportOpen(true)}>Export</button> : null} />
-      <div className="filters"><label className="searchbox"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search invoice, customer, or staff" /></label><select value={method} onChange={(e) => setMethod(e.target.value)}><option>All Methods</option><option>Card</option><option>Cash</option><option>Qr</option></select><select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id}>{member.name}</option>)}</select><input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} /></div>
+    <section className="page sales-page">
+      <PageHeader title="Sales History" subtitle="View and manage transaction records." action={access.canExportSales ? <button className="outline sales-export-button" onClick={() => setExportOpen(true)}>Export</button> : null} />
+      <div className="filters sales-filters"><label className="searchbox sales-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search invoice, customer, or staff" /></label><select value={method} onChange={(e) => setMethod(e.target.value)}><option>All Methods</option><option>Card</option><option>Cash</option><option>Qr</option></select><select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id}>{member.name}</option>)}</select><DateInput value={dateFilter} onChange={(date) => setDateFilter(date ? dateInputKey(date) : "")} /></div>
       <div className="sales-summary">
         <div><span>Total invoices</span><strong>{filtered.length}</strong></div>
-        <div><span>Total amount</span><strong>{INR.format(filteredTotal)}</strong></div>
+        {access.canViewSalesTotals ? <div><span>Total amount</span><strong>{INR.format(filteredTotal)}</strong></div> : null}
       </div>
       <DataTable headers={["Invoice", "Date", "Customer", "Items", "Total", "Payment", "Status", "Salesperson", "Actions"]}>
         {filtered.length === 0 ? (
           <tr><td className="empty-table" colSpan={9}>No Data Available</td></tr>
         ) : filtered.map((invoice) => (
-          <tr key={invoice.id}><td><button className="linkish invoice-link" onClick={() => setSelected({ invoice, mode: "view" })}>{invoice.id}</button></td><td>{invoice.date}</td><td>{invoice.customer}</td><td>{invoice.items}</td><td><strong>{INR.format(invoice.total)}</strong></td><td>{invoice.payment}</td><td><span className={`status ${invoice.status.toLowerCase()}`}>{invoice.status}</span></td><td>{invoice.salespersonName || invoice.staff || "Unassigned"}</td><td className="actions"><button className="safe-action" title="View bill" onClick={() => setSelected({ invoice, mode: "view" })}><Eye size={16} /></button>{access.canEditInvoice ? <button className="safe-action" title="Edit bill" onClick={() => setSelected({ invoice, mode: "edit" })}><Edit size={16} /></button> : null}{access.canDeleteInvoice ? <button className="danger-action" title="Delete invoice" onClick={() => deleteInvoice(invoice)}><Trash2 size={16} /></button> : null}</td></tr>
+          <tr key={invoice.id}><td><button className="linkish invoice-link" onClick={() => setSelected({ invoice, mode: "view" })}>{invoice.id}</button></td><td>{formatDateTime(invoice.date)}</td><td>{invoice.customer}</td><td>{invoice.items}</td><td><strong>{INR.format(invoiceDisplayTotal(invoice, products))}</strong></td><td>{invoice.payment}</td><td><span className={`status ${invoice.status.toLowerCase()}`}>{invoice.status}</span></td><td>{invoice.salespersonName || invoice.staff || "Unassigned"}</td><td className="actions"><button className="safe-action" title="View bill" onClick={() => setSelected({ invoice, mode: "view" })}><Eye size={16} /></button>{access.canEditInvoice ? <button className="safe-action" title="Edit bill" onClick={() => setSelected({ invoice, mode: "edit" })}><Edit size={16} /></button> : null}{access.canDeleteInvoice ? <button className="danger-action" title="Delete invoice" onClick={() => deleteInvoice(invoice)}><Trash2 size={16} /></button> : null}</td></tr>
         ))}
       </DataTable>
       {selected && <InvoiceModal invoice={selected.invoice} mode={selected.mode} canEdit={access.canEditInvoice} staff={staff} products={products} onClose={() => setSelected(null)} onEdit={() => setSelected((current) => current ? { invoice: current.invoice, mode: "edit" } : current)} onSave={(invoice) => {
@@ -1720,12 +1966,16 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
   }
 
   if (mode === "view") {
+    const displayedViewTotal = viewInvoice.lines?.length ? summarizeInvoiceLines(viewInvoice.lines, invoice.discount ?? 0).total : viewInvoice.total;
+    const viewLineAmounts = viewInvoice.lines?.map((line) => ({ line, amount: amountForLine(line) })) ?? [];
+    const viewGst = viewLineAmounts.reduce((sum, item) => sum + item.amount.gst, 0);
+    const viewItemCount = viewInvoice.lines?.reduce((sum, line) => sum + orderLineQuantity(line), 0) ?? 0;
     return (
       <Modal onClose={onClose} className="invoice-modal">
-        <div className="modal-head"><div><h2>Invoice {invoice.id}</h2><p>Total Amount: <strong>{INR.format(invoice.total)}</strong></p></div><button onClick={onClose}><X size={20} /></button></div>
+        <div className="modal-head"><div><h2>Invoice {invoice.id}</h2><p>Total Amount: <strong>{INR.format(displayedViewTotal)}</strong></p></div><button onClick={onClose}><X size={20} /></button></div>
         <div className="bill-view">
           <div className="bill-view-grid">
-            <div><span>Date</span><strong>{viewInvoice.date}</strong></div>
+            <div><span>Date</span><strong>{formatDateTime(viewInvoice.date)}</strong></div>
             <div><span>Customer</span><strong>{viewInvoice.customer}</strong></div>
             <div><span>Payment</span><strong>{viewInvoice.payment}</strong></div>
             <div><span>Status</span><strong>{viewInvoice.status}</strong></div>
@@ -1734,14 +1984,48 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
           </div>
           <div className="bill-view-lines">
             <strong>Bill Products</strong>
-            {viewInvoice.lines?.length ? viewInvoice.lines.map((line) => {
-              const amount = amountForLine(line);
-              return <div className="bill-view-line" key={line.id}><div><strong>{line.product.name}</strong><span>{linePriceLabel(line)}</span></div><span>{INR.format(amount.total)}</span></div>;
-            }) : <div className="empty compact">Product lines are not available for this invoice. The saved bill total is shown below.</div>}
+            {viewLineAmounts.length ? (
+              <div className="bill-products-table">
+                <div className="bill-products-head">
+                  <span>Item</span>
+                  <span>Qty</span>
+                  <span>Rate</span>
+                  <span>GST</span>
+                  <span>Amount</span>
+                </div>
+                <div className="bill-products-body bill-table-scroll">
+                  {viewLineAmounts.map(({ line, amount }) => {
+                    const unitAmount = amountForProduct(line.product);
+                    return (
+                      <div className="bill-products-row" key={line.id}>
+                        <div>
+                          <strong>{line.product.name}</strong>
+                          <small>{line.product.gstRate > 0 ? `incl. GST ${line.product.gstRate}%` : "No GST"}</small>
+                        </div>
+                        <span>{lineQuantityLabel(line)}</span>
+                        <span>{INR.format(unitAmount.base)}</span>
+                        <span className="gst-inline">+{INR.format(amount.gst)}</span>
+                        <span>{INR.format(amount.total)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="bill-products-foot">
+                  <span>{viewLineAmounts.length} product{viewLineAmounts.length === 1 ? "" : "s"} · {viewItemCount} item{viewItemCount === 1 ? "" : "s"} total</span>
+                </div>
+              </div>
+            ) : <div className="empty compact">Product lines are not available for this invoice. The saved bill total is shown below.</div>}
           </div>
-          <div className="bill-view-total"><span>Total Amount</span><strong>{INR.format(viewInvoice.total)}</strong></div>
+          <div className="bill-view-total bill-view-summary">
+            {viewLineAmounts.length ? <>
+              <div className="gst-split"><span><em>CGST (50% of GST)</em><em>SGST (50% of GST)</em></span><strong><em>{INR.format(viewGst / 2)}</em><em>{INR.format(viewGst / 2)}</em></strong></div>
+              <div><span>Total GST</span><strong>{INR.format(viewGst)}</strong></div>
+              <hr />
+              <div className="summary-payable"><span>Total Payable (incl. GST)</span><strong>{INR.format(displayedViewTotal)}</strong></div>
+            </> : <><span>Total Amount</span><strong>{INR.format(displayedViewTotal)}</strong></>}
+          </div>
         </div>
-        <div className="modal-actions"><button className="outline" onClick={() => printInvoice(viewInvoice)}>Print Bill</button>{canEdit ? <button className="primary" onClick={onEdit}>Edit Bill</button> : null}<button className="outline" onClick={onClose}>Close</button></div>
+        <div className="modal-actions">{canEdit ? <button className="outline edit-bill-button" onClick={onEdit}>Edit Bill</button> : null}<button className="outline" onClick={() => printInvoice(viewInvoice)}>Print Bill</button><button className="outline" onClick={onClose}>Close</button></div>
       </Modal>
     );
   }
@@ -1751,37 +2035,47 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
       <div className="modal-head"><div><h2>Invoice {invoice.id}</h2><p>Total Amount: <strong>{INR.format(editedTotal)}</strong></p></div><button onClick={onClose}><X size={20} /></button></div>
       <div className="form-grid two"><TextField label="Customer" value={customer} onChange={setCustomer} /><label className="field"><span>Payment</span><select value={payment} onChange={(e) => setPayment(e.target.value)}><option>Card</option><option>Cash</option><option>Qr</option></select></label></div>
       <div className="form-grid two"><label className="field"><span>Status</span><select value={status} onChange={(e) => setStatus(e.target.value as Invoice["status"])}><option>Completed</option><option>Refunded</option></select></label><label className="field"><span>Staff</span><select value={staffName} onChange={(e) => setStaffName(e.target.value)}>{staff.map((member) => <option key={member.id}>{member.name}</option>)}</select></label></div>
-      <div className="form-grid"><TextField label="Bill Total" type="number" value={manualOverride ? manualTotal : String(lineTotals.total.toFixed(2))} onChange={(value) => { setManualOverride(true); setManualTotal(value); }} /></div>
-      <button className="outline full use-product-total" disabled={!activeLines.length} onClick={useProductTotal}>Use Product Total</button>
+      <div className="bill-total-row"><TextField label="Bill Total" type="number" value={manualOverride ? manualTotal : String(lineTotals.total.toFixed(2))} onChange={(value) => { setManualOverride(true); setManualTotal(value); }} /><button className="primary use-product-total" disabled={!activeLines.length} onClick={useProductTotal}>Use Product Total</button></div>
       <div className="bill-editor">
-        <div className="bill-editor-head"><strong>Edit / Exchange Products</strong><label><span>Add product</span><select defaultValue="" onChange={(e) => { addProduct(e.target.value || selectedProductId); e.currentTarget.value = ""; }}><option value="">Select product</option>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label></div>
-        {lines.length ? lines.map((line) => {
-          const returned = isReturnedLine(line);
-          const confirmed = confirmedLineIds.includes(line.id);
-          const isNew = line.rowState === "new";
-          return (
-            <div className={`bill-line-editor ${isNew ? "new-line" : ""} ${returned ? "returned-line" : ""} ${confirmed ? "confirmed-line" : ""}`} key={line.id}>
-              <label className="bill-product-field"><span>Product</span><select disabled={returned} value={line.product.id} onChange={(e) => replaceProduct(line.id, e.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
-              <div className="bill-line-controls">
-                {line.type === "standard" ? <label className="bill-number-field qty-stepper-field"><span>Qty</span><div className="bill-qty-stepper"><button type="button" disabled={returned} onClick={() => {
-                  const step = line.product.unitType === "piece" ? 1 : 0.5;
-                  updateLine(line.id, { qty: Math.max(step, line.qty - step) });
-                }}>−</button><input readOnly={returned} type="number" min={line.product.unitType === "piece" ? "1" : "0.5"} step={line.product.unitType === "piece" ? "1" : "0.5"} value={line.qty} onChange={(e) => updateLine(line.id, { qty: Number(e.target.value) })} /><button type="button" disabled={returned} onClick={() => {
-                  const step = line.product.unitType === "piece" ? 1 : 0.5;
-                  updateLine(line.id, { qty: line.qty + step });
-                }}>+</button></div></label> : <>
-                  <label className="bill-number-field"><span>Pieces</span><input readOnly={returned} type="number" min="1" step="1" value={line.pieces} onChange={(e) => updateLine(line.id, { pieces: Number(e.target.value) })} /></label>
-                  <label className="bill-number-field length-field"><span>Length</span><input readOnly={returned} type="number" min="0.5" step="0.5" value={line.lengthPerPiece} onChange={(e) => updateLine(line.id, { lengthPerPiece: Number(e.target.value) })} /></label>
-                </>}
-                <div className="line-price-badge">{linePriceLabel(line)}</div>
-                <div className="bill-row-actions">{!isNew ? <button className={`outline return-line ${returned ? "undo-line" : ""}`} onClick={() => returnLine(line.id)}>{returned ? "Undo" : "Return"}</button> : null}<button className="primary add-line" disabled={returned} onClick={() => confirmLine(line.id)}>{confirmed ? <Check size={15} /> : null}Add</button></div>
-              </div>
+        <div className="bill-editor-head compact"><strong>Edit / Exchange Products</strong><label><span>Add product</span><select defaultValue="" onChange={(e) => { addProduct(e.target.value || selectedProductId); e.currentTarget.value = ""; }}><option value="">Select product</option>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label></div>
+        {lines.length ? (
+          <div className="bill-edit-table">
+            <div className="bill-edit-head">{["Product", "Qty", "Price", "Action"].map((heading) => <span key={heading}>{heading}</span>)}</div>
+            <div className="bill-edit-body bill-table-scroll">
+              {lines.map((line) => {
+                const returned = isReturnedLine(line);
+                const confirmed = confirmedLineIds.includes(line.id);
+                const isNew = line.rowState === "new";
+                return (
+                  <div className={`bill-edit-row ${isNew ? "new-line" : ""} ${returned ? "returned-line" : ""} ${confirmed ? "confirmed-line" : ""}`} key={line.id}>
+                    <select className="bill-edit-product" disabled={returned} value={line.product.id} onChange={(e) => replaceProduct(line.id, e.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select>
+                    <div className="bill-edit-qty">
+                      {line.type === "standard" ? <>
+                        <button type="button" disabled={returned} onClick={() => {
+                          const step = line.product.unitType === "piece" ? 1 : 0.5;
+                          updateLine(line.id, { qty: Math.max(step, line.qty - step) });
+                        }}>−</button>
+                        <input readOnly={returned} type="number" min={line.product.unitType === "piece" ? "1" : "0.5"} step={line.product.unitType === "piece" ? "1" : "0.5"} value={line.qty} onChange={(e) => updateLine(line.id, { qty: Number(e.target.value) })} />
+                        <button type="button" disabled={returned} onClick={() => {
+                          const step = line.product.unitType === "piece" ? 1 : 0.5;
+                          updateLine(line.id, { qty: line.qty + step });
+                        }}>+</button>
+                      </> : <>
+                        <input readOnly={returned} type="number" min="1" step="1" value={line.pieces} onChange={(e) => updateLine(line.id, { pieces: Number(e.target.value) })} />
+                        <input readOnly={returned} type="number" min="0.5" step="0.5" value={line.lengthPerPiece} onChange={(e) => updateLine(line.id, { lengthPerPiece: Number(e.target.value) })} />
+                      </>}
+                    </div>
+                    <div className="bill-edit-price"><span>{INR.format(amountForProduct(line.product).total)}/{lineUnitSuffix(line)}</span>{line.product.gstRate > 0 ? <small>incl. GST</small> : null}</div>
+                    <div className="bill-edit-actions">{!isNew ? <button className={`return-line ${returned ? "undo-line" : ""}`} onClick={() => returnLine(line.id)}>{returned ? "Undo" : "Return"}</button> : null}<button className="add-line" disabled={returned} onClick={() => confirmLine(line.id)}>{confirmed ? <Check size={15} /> : null}Add</button></div>
+                  </div>
+                );
+              })}
             </div>
-          );
-        }) : <div className="empty compact">No product lines saved for this older invoice. Add products above or edit the manual total.</div>}
+          </div>
+        ) : <div className="empty compact">No product lines saved for this older invoice. Add products above or edit the manual total.</div>}
       </div>
       <div className="demo-box">
-        <span>Date: {invoice.date}</span>
+        <span>Date: {formatDateTime(invoice.date)}</span>
         <span>Items: {nextInvoice.items}</span>
         <span>Total: {INR.format(nextInvoice.total)}</span>
       </div>
@@ -1791,7 +2085,9 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
 }
 
 function Inventory() {
-  const { products, setProducts, showToast } = useApp();
+  const { products, setProducts, staff, showToast } = useApp();
+  const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
+  const access = roleAccess(currentUser.role);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<Product | null>(null);
   const [open, setOpen] = useState(false);
@@ -1811,7 +2107,7 @@ function Inventory() {
       <PageHeader title="Inventory" subtitle="Manage your products and stock levels." action={<div className="toolbar-actions">{bulkMode ? <><button className="outline" onClick={() => { setBulkMode(false); setSelectedIds([]); }}>Cancel</button><button className="primary" disabled={!selectedIds.length} onClick={() => setPrintProducts(selectedProducts)}>{selectedIds.length} selected · Print Labels</button></> : <><button className="outline" onClick={fixProductCodes}>Fix Codes</button><button className="outline" onClick={() => setBulkMode(true)}>Print Labels</button><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Product</button></>}</div>} />
       <label className="searchbox top-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search inventory..." /></label>
       <DataTable headers={[...(bulkMode ? ["Select"] : []), "Product Name", "SKU", "Category", "Unit", "Price", "GST", "Stock", "Actions"]}>
-        {rows.map((p) => <tr key={p.id}>{bulkMode ? <td><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, p.id] : ids.filter((id) => id !== p.id))} /></td> : null}<td><strong>{p.name}</strong>{p.barcode ? <button className="barcode-mini" title="View barcode" onClick={() => setBarcodePreview(p)}><ScanBarcode size={15} /></button> : null}</td><td className="linkish">{p.sku}</td><td>{p.category}</td><td>{unitLabel(p.unitType)}</td><td>{INR.format(p.price)}</td><td><GSTPill rate={p.gstRate} /></td><td><span className={`stock-pill ${p.stock <= 10 ? "low" : ""}`}>{p.stock}</span></td><td className="actions"><button onClick={() => { setEditing(p); setOpen(true); }}><Edit size={16} /></button><button onClick={() => setPrintProducts([p])} title="Print labels"><ScanBarcode size={16} /></button><button onClick={() => setProducts((items) => items.filter((item) => item.id !== p.id))}><Trash2 size={16} /></button></td></tr>)}
+        {rows.length ? rows.map((p) => <tr key={p.id}>{bulkMode ? <td><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, p.id] : ids.filter((id) => id !== p.id))} /></td> : null}<td><strong>{p.name}</strong>{p.barcode ? <button className="barcode-mini" title="View barcode" onClick={() => setBarcodePreview(p)}><ScanBarcode size={15} /></button> : null}</td><td className="linkish">{p.sku}</td><td>{p.category}</td><td>{unitLabel(p.unitType)}</td><td>{INR.format(p.price)}</td><td><GSTPill rate={p.gstRate} /></td><td><span className={`stock-pill ${p.stock <= 10 ? "low" : ""}`}>{p.stock}</span></td><td className="actions"><button onClick={() => { setEditing(p); setOpen(true); }}><Edit size={16} /></button><button onClick={() => setPrintProducts([p])} title="Print labels"><ScanBarcode size={16} /></button>{access.canDeleteProducts ? <button onClick={() => setProducts((items) => items.filter((item) => item.id !== p.id))}><Trash2 size={16} /></button> : null}</td></tr>) : <tr><td className="empty-table" colSpan={bulkMode ? 9 : 8}>No Data Available</td></tr>}
       </DataTable>
       {open && <ProductModal product={editing} onClose={() => setOpen(false)} onSave={(product) => {
         setProducts((items) => editing ? items.map((item) => item.id === editing.id ? product : item) : [...items, product]);
@@ -1948,12 +2244,12 @@ function DateRangeFilter({ mode, setMode, customFrom, setCustomFrom, customTo, s
       <div className="range-filter-pills">
         {(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${mode === item ? "active" : ""}`} onClick={() => setMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}
       </div>
-      {mode === "custom" ? <div className="custom-date-row"><label><span>From</span><input type="date" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} /></label><label><span>To</span><input type="date" value={customTo} onChange={(event) => setCustomTo(event.target.value)} /></label></div> : null}
+      {mode === "custom" ? <div className="custom-date-row"><label><span>From</span><DateInput value={customFrom} onChange={(date) => setCustomFrom(date ? dateInputKey(date) : "")} /></label><label><span>To</span><DateInput value={customTo} onChange={(date) => setCustomTo(date ? dateInputKey(date) : "")} /></label></div> : null}
     </div>
   );
 }
 
-function getPerformanceStats(invoices: Invoice[], range: { from: Date; to: Date }) {
+function getPerformanceStats(invoices: Invoice[], products: Product[], range: { from: Date; to: Date }) {
   const filtered = invoices.filter((invoice) => {
     const time = new Date(invoice.date).getTime();
     return time >= range.from.getTime() && time <= range.to.getTime();
@@ -1961,13 +2257,14 @@ function getPerformanceStats(invoices: Invoice[], range: { from: Date; to: Date 
   const stats = Object.values(filtered.reduce((acc, invoice) => {
     const id = invoice.salespersonId || "unassigned";
     const name = invoice.salespersonName || invoice.staff || "Unassigned";
+    const total = invoiceDisplayTotal(invoice, products);
     if (!acc[id]) acc[id] = { salespersonId: id, salespersonName: name, salesCount: 0, totalRevenue: 0, returnsCount: 0, returnsValue: 0 };
     if (invoice.status === "Refunded") {
       acc[id].returnsCount += 1;
-      acc[id].returnsValue += invoice.total;
+      acc[id].returnsValue += total;
     } else {
       acc[id].salesCount += 1;
-      acc[id].totalRevenue += invoice.total;
+      acc[id].totalRevenue += total;
     }
     return acc;
   }, {} as Record<string, { salespersonId: string; salespersonName: string; salesCount: number; totalRevenue: number; returnsCount: number; returnsValue: number }>))
@@ -1977,14 +2274,14 @@ function getPerformanceStats(invoices: Invoice[], range: { from: Date; to: Date 
 }
 
 function Performance() {
-  const { invoices, staff, attendance, setAttendance, showToast } = useApp();
+  const { invoices, products, staff, attendance, setAttendance, showToast } = useApp();
   const [tab, setTab] = useState<"sales" | "attendance">("sales");
   const [rangeMode, setRangeMode] = useState<DateRangeMode>("today");
   const [customFrom, setCustomFrom] = useState(dateInputKey(new Date()));
   const [customTo, setCustomTo] = useState(dateInputKey(new Date()));
   const range = rangeBounds(rangeMode, customFrom, customTo);
   const owner = staff.find((member) => member.role === "Owner") ?? staff[0];
-  const { stats } = getPerformanceStats(invoices, range);
+  const { stats } = getPerformanceStats(invoices, products, range);
   const exportRows = () => {
     const rows = [["Rank", "Name", "Role", "Sales Count", "Total Revenue", "Avg Sale", "Returns Count", "Returns Value", "Net Revenue"], ...stats.map((row, index) => {
       const member = staff.find((item) => item.id === row.salespersonId);
@@ -2000,14 +2297,14 @@ function Performance() {
         <div className="performance-tabs"><button className={tab === "sales" ? "active" : ""} onClick={() => setTab("sales")}>Sales Performance</button><button className={tab === "attendance" ? "active" : ""} onClick={() => setTab("attendance")}>Attendance</button></div>
         {tab === "sales" ? <button className="outline export-csv-btn" onClick={exportRows}>Export CSV</button> : null}
       </div>
-      {tab === "sales" ? <SalesPerformanceTab invoices={invoices} staff={staff} range={range} /> : <AttendanceTab staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} range={range} rangeMode={rangeMode} customFrom={customFrom} customTo={customTo} />}
+      {tab === "sales" ? <SalesPerformanceTab invoices={invoices} products={products} staff={staff} range={range} /> : <AttendanceTab staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} range={range} rangeMode={rangeMode} customFrom={customFrom} customTo={customTo} />}
     </section>
   );
 }
 
-function SalesPerformanceTab({ invoices, staff, range }: { invoices: Invoice[]; staff: Staff[]; range: { from: Date; to: Date } }) {
+function SalesPerformanceTab({ invoices, products, staff, range }: { invoices: Invoice[]; products: Product[]; staff: Staff[]; range: { from: Date; to: Date } }) {
   const [selected, setSelected] = useState<string | null>(null);
-  const { filtered, stats } = getPerformanceStats(invoices, range);
+  const { filtered, stats } = getPerformanceStats(invoices, products, range);
   const totalSales = stats.reduce((sum, row) => sum + row.totalRevenue, 0);
   const salesCount = stats.reduce((sum, row) => sum + row.salesCount, 0);
   const top = stats[0];
@@ -2028,7 +2325,7 @@ function SalesPerformanceTab({ invoices, staff, range }: { invoices: Invoice[]; 
           return <tr key={row.salespersonId} onClick={() => setSelected(row.salespersonId)} className={row.salespersonId === "unassigned" ? "muted-row" : ""}><td><span className="rank-badge">{index + 1}</span></td><td><div className="person-cell"><div className="avatar sm">{staffInitials(row.salespersonName)}</div><strong>{row.salespersonName}</strong><small>{member?.role ?? "Unassigned"}</small></div></td><td>{row.salesCount}</td><td>{INR.format(row.totalRevenue)}</td><td>{INR.format(row.avgSaleValue)}</td><td className={row.returnsCount ? "red-text" : "muted"}>{row.returnsCount} · {INR.format(row.returnsValue)}</td><td><strong className="green-text">{INR.format(row.netRevenue)}</strong></td></tr>;
         }) : <tr><td className="empty-table" colSpan={7}>No performance data for this range.</td></tr>}
       </DataTable>
-      {selected ? <Modal onClose={() => setSelected(null)} className="drawer-modal"><div className="modal-head"><div><h2>{stats.find((row) => row.salespersonId === selected)?.salespersonName}</h2><p>Sales in selected date range</p></div><button onClick={() => setSelected(null)}><X size={20} /></button></div><div className="demo-box">{selectedRows.length ? selectedRows.map((invoice) => <span key={invoice.id}>{invoice.date} · {invoice.id} · {invoice.items} · {INR.format(invoice.total)} · {invoice.status}</span>) : <span>No sales found.</span>}</div></Modal> : null}
+      {selected ? <Modal onClose={() => setSelected(null)} className="drawer-modal"><div className="modal-head"><div><h2>{stats.find((row) => row.salespersonId === selected)?.salespersonName}</h2><p>Sales in selected date range</p></div><button onClick={() => setSelected(null)}><X size={20} /></button></div><div className="demo-box">{selectedRows.length ? selectedRows.map((invoice) => <span key={invoice.id}>{formatDateTime(invoice.date)} · {invoice.id} · {invoice.items} · {INR.format(invoiceDisplayTotal(invoice, products))} · {invoice.status}</span>) : <span>No sales found.</span>}</div></Modal> : null}
     </>
   );
 }
@@ -2073,7 +2370,7 @@ function MarkAttendance({ staff, owner, attendance, setAttendance, showToast }: 
   };
   return (
     <div className="attendance-panel">
-      <div className="attendance-head"><strong>Attendance — {longDate(new Date(date))}</strong><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></div>
+      <div className="attendance-head"><strong>Attendance — {formatDate(date)}</strong><DateInput value={date} onChange={(nextDate) => setDate(nextDate ? dateInputKey(nextDate) : "")} /></div>
       {recordsForDate.length ? <div className="success-banner">Attendance marked for this date — tap to edit</div> : null}
       <div className="attendance-actions"><button className="outline" onClick={() => setDrafts((rows) => rows.map((row) => ({ ...row, status: "present", checkInTime: row.checkInTime || "09:30", checkOutTime: row.checkOutTime || "18:00", hoursWorked: hoursBetween(row.checkInTime || "09:30", row.checkOutTime || "18:00") })))}>Mark All Present</button><button className="outline" onClick={copyYesterday}>Copy Yesterday</button></div>
       <div className="attendance-list">{drafts.map((record) => <AttendanceRow key={record.staffId} record={record} staff={staff.find((member) => member.id === record.staffId)} update={update} />)}</div>
@@ -2089,7 +2386,7 @@ function AttendanceRow({ record, staff, update }: { record: AttendanceRecord; st
     <div className={`attendance-row ${record.status}`}>
       <div className="person-cell"><div className="avatar sm">{staffInitials(record.staffName)}</div><strong>{record.staffName}</strong><small>{staff?.role}</small></div>
       <div className="status-pills">{(["present", "absent", "half-day", "late", "leave"] as AttendanceStatus[]).map((status) => <button key={status} className={`${status} ${record.status === status ? "active" : ""}`} onClick={() => update(record.staffId, { status })}>{statusShort(status)}</button>)}</div>
-      {showTime ? <div className="time-section"><span><TimeInput value={record.checkInTime ?? ""} onChange={(time) => update(record.staffId, { checkInTime: time })} /><em>{amPm(record.checkInTime)}</em></span><span><TimeInput value={record.checkOutTime ?? ""} onChange={(time) => update(record.staffId, { checkOutTime: time })} /><em>{amPm(record.checkOutTime)}</em></span><small className={duration === "Invalid" ? "red-text" : ""}>{duration || "--"}</small></div> : <span className="muted">No hours</span>}
+      {showTime ? <div className="time-section"><span><input className="attendance-time-input" type="time" value={record.checkInTime ?? ""} onChange={(event) => update(record.staffId, { checkInTime: event.target.value })} /></span><span><input className="attendance-time-input" type="time" value={record.checkOutTime ?? ""} onChange={(event) => update(record.staffId, { checkOutTime: event.target.value })} /></span><small className={duration === "Invalid" ? "red-text" : ""}>{duration || "--"}</small></div> : <span className="muted">No hours</span>}
       <input value={record.notes ?? ""} onChange={(event) => update(record.staffId, { notes: event.target.value })} placeholder="Note" />
     </div>
   );
@@ -2109,7 +2406,7 @@ function AttendanceReport({ staff, attendance, range, rangeMode }: { staff: Staf
   return (
     <div className="attendance-panel">
       <div className="attendance-toolbar"><select value={staffId} onChange={(event) => setStaffId(event.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select><div className="attendance-toolbar-bottom"><div className="view-toggle"><button className={view === "list" ? "active" : ""} onClick={() => setView("list")}><List size={14} />List View</button><button className={view === "calendar" ? "active" : ""} onClick={() => setView("calendar")}><CalendarDays size={14} />Calendar View</button></div><button className="outline attendance-export" onClick={exportRows}><Download size={16} /><span>Export Attendance</span></button></div></div>
-      {view === "list" ? <DataTable headers={["Date", "Staff Name", "Status", "Check-in", "Check-out", "Hours", "Notes"]}>{rows.length ? rows.map((record) => <tr key={record.id}><td>{longDate(new Date(record.date))}</td><td>{record.staffName}</td><td><span className={`attendance-badge ${record.status}`}>{statusLabel(record.status)}</span></td><td>{record.checkInTime ?? "--"}</td><td>{record.checkOutTime ?? "--"}</td><td>{record.hoursWorked ?? "--"}</td><td>{record.notes ?? ""}</td></tr>) : <tr><td className="empty-table" colSpan={7}>No attendance records found.</td></tr>}</DataTable> : <AttendanceCalendar records={rows} staff={staff} month={range.from} />}</div>
+      {view === "list" ? <DataTable headers={["Date", "Staff Name", "Status", "Check-in", "Check-out", "Hours", "Notes"]}>{rows.length ? rows.map((record) => <tr key={record.id}><td>{formatDate(record.date)}</td><td>{record.staffName}</td><td><span className={`attendance-badge ${record.status}`}>{statusLabel(record.status)}</span></td><td>{record.checkInTime ?? "--"}</td><td>{record.checkOutTime ?? "--"}</td><td>{record.hoursWorked ?? "--"}</td><td>{record.notes ?? ""}</td></tr>) : <tr><td className="empty-table" colSpan={7}>No attendance records found.</td></tr>}</DataTable> : <AttendanceCalendar records={rows} staff={staff} month={range.from} />}</div>
   );
 }
 
@@ -2156,19 +2453,55 @@ function MonthlySummary({ staff, attendance, customFrom }: { staff: Staff[]; att
 }
 
 function Customers() {
-  const { customers } = useApp();
+  const { customers, setCustomers, invoices, staff, products, showToast } = useApp();
+  const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Customer | null>(null);
+  const [historyInvoice, setHistoryInvoice] = useState<Invoice | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
   const rows = customers.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
+  const customerInvoices = (customer: Customer) => {
+    return invoices.filter((invoice) => invoice.customerId === customer.id || (!invoice.customerId && invoice.customer !== "Walk-in" && invoice.customer === customer.name));
+  };
+  const customerTotalSpent = (customer: Customer) => customerInvoices(customer).reduce((sum, invoice) => sum + invoiceDisplayTotal(invoice, products), 0);
+  const customerLastVisit = (customer: Customer) => {
+    const recent = [...customerInvoices(customer)].sort((a, b) => invoiceTime(b) - invoiceTime(a))[0];
+    return recent ? formatDateTime(recent.date) : "-";
+  };
+  const historyInvoices = selected ? customerInvoices(selected) : [];
   return (
     <section className="page">
-      <PageHeader title="Customers" subtitle="Manage your customer base and view their history." action={<button className="primary"><Plus size={16} />Add Customer</button>} />
+      <PageHeader title="Customers" subtitle="Manage your customer base and view their history." action={<button className="primary" onClick={() => setAddOpen(true)}><Plus size={16} />Add Customer</button>} />
       <label className="searchbox top-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search customers..." /></label>
       <DataTable headers={["Customer Name", "Contact Info", "Total Spent", "Last Visit", "Actions"]}>
-        {rows.map((c) => <tr key={c.email}><td><div className="person-cell"><div className="avatar sm">{c.name[0]}</div><strong>{c.name}</strong></div></td><td><span>{c.email}</span><small>{c.phone}</small></td><td>{INR.format(c.spent)}</td><td>{c.lastVisit}</td><td><button className="link-button" onClick={() => setSelected(c)}><Eye size={16} />View History</button></td></tr>)}
+        {rows.length ? rows.map((c) => <tr key={c.email || c.id}><td><div className="person-cell"><div className="avatar sm">{c.name[0]}</div><strong>{c.name}</strong></div></td><td><span>{c.email}</span><small>{c.phone}</small></td><td>{INR.format(customerTotalSpent(c))}</td><td>{customerLastVisit(c)}</td><td><button className="link-button" onClick={() => setSelected(c)}><Eye size={16} />View History</button></td></tr>) : <tr><td className="empty-table" colSpan={5}>No Data Available</td></tr>}
       </DataTable>
-      {selected && <Modal onClose={() => setSelected(null)} className="drawer-modal"><div className="modal-head"><h2>{selected.name} History</h2><button onClick={() => setSelected(null)}><X size={20} /></button></div><p className="muted">Recent invoices for {selected.email}</p><div className="demo-box"><span>INV-0001 · Card · {INR.format(119.98)}</span><span>INV-0003 · Card · {INR.format(259.97)}</span></div></Modal>}
+      {selected && <Modal onClose={() => setSelected(null)} className="drawer-modal"><div className="modal-head"><h2>{selected.name} History</h2><div className="modal-head-actions"><button className="outline" onClick={() => { const customerId = selected.id; setSelected(null); navigate("/pos", { state: { customerId } }); }}>New Bill</button><button onClick={() => setSelected(null)}><X size={20} /></button></div></div><p className="muted">Recent invoices for {selected.email}</p><div className="demo-box">{historyInvoices.length ? historyInvoices.map((invoice) => <div className="customer-invoice-row" key={invoice.id}><span>{invoice.id} · {invoice.payment} · {INR.format(invoiceDisplayTotal(invoice, products))}</span><button type="button" onClick={() => setHistoryInvoice(invoice)}><Eye size={15} />View</button></div>) : <div className="history-empty">No Data Available</div>}</div></Modal>}
+      {historyInvoice ? <InvoiceModal invoice={historyInvoice} mode="view" canEdit={false} staff={staff} products={products} onClose={() => setHistoryInvoice(null)} onEdit={() => undefined} onSave={() => undefined} /> : null}
+      {addOpen ? <CustomerModal onClose={() => setAddOpen(false)} onSave={(customer) => { setCustomers((items) => [customer, ...items]); setAddOpen(false); showToast("Customer added successfully"); }} /> : null}
     </section>
+  );
+}
+
+function CustomerModal({ onClose, onSave }: { onClose: () => void; onSave: (customer: Customer) => void }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [touched, setTouched] = useState(false);
+  const nameValid = name.trim().length > 0;
+  const save = () => {
+    setTouched(true);
+    if (!nameValid) return;
+    onSave({ id: crypto.randomUUID(), name: name.trim(), email: email.trim(), phone: phone.trim(), spent: 0, lastVisit: "-" });
+  };
+  return (
+    <Modal onClose={onClose} className="drawer-modal">
+      <div className="modal-head"><h2>Add Customer</h2><button onClick={onClose}><X size={20} /></button></div>
+      <label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Customer name" />{touched && !nameValid ? <small className="field-error">Name field cannot be empty</small> : null}</label>
+      <label className="field"><span>Email</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Optional" /></label>
+      <label className="field"><span>Phone</span><input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="Optional" /></label>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" onClick={save}>Save Customer</button></div>
+    </Modal>
   );
 }
 
@@ -2207,10 +2540,10 @@ function Reports() {
         <div className="card audit-card"><h2>Business Audit</h2>{auditChecks.map((item) => <div className="audit-row" key={item.label}><div><strong>{item.label}</strong><span>{item.detail}</span></div><span className={`audit-pill ${item.tone}`}>{item.value}</span></div>)}</div>
       </div>
       <DataTable headers={["Invoice", "Date", "Customer", "Total Amount", "Payment", "Status"]}>
-        {activeInvoices.map((invoice) => <tr key={invoice.id}><td className="linkish">{invoice.id}</td><td>{invoice.date}</td><td>{invoice.customer}</td><td><strong>{INR.format(invoice.total)}</strong></td><td>{invoice.payment}</td><td><span className={`status ${invoice.status.toLowerCase()}`}>{invoice.status}</span></td></tr>)}
+        {activeInvoices.map((invoice) => <tr key={invoice.id}><td className="linkish">{invoice.id}</td><td>{formatDateTime(invoice.date)}</td><td>{invoice.customer}</td><td><strong>{INR.format(invoice.total)}</strong></td><td>{invoice.payment}</td><td><span className={`status ${invoice.status.toLowerCase()}`}>{invoice.status}</span></td></tr>)}
       </DataTable>
       <DataTable headers={["Expense", "Date", "Category", "Vendor", "Amount", "Payment"]}>
-        {activeExpenses.map((expense) => <tr key={expense.id}><td className="linkish">{expense.id}</td><td>{expense.date}</td><td>{expense.category}</td><td>{expense.vendor}</td><td><strong>{INR.format(expense.amount)}</strong></td><td>{expense.payment}</td></tr>)}
+        {activeExpenses.map((expense) => <tr key={expense.id}><td className="linkish">{expense.id}</td><td>{formatDateTime(expense.date)}</td><td>{expense.category}</td><td>{expense.vendor}</td><td><strong>{INR.format(expense.amount)}</strong></td><td>{expense.payment}</td></tr>)}
       </DataTable>
       <DataTable headers={["Audit Item", "Basis", "Amount", "Business Note"]}>
         {auditChecks.map((item) => <tr key={item.label}><td className="linkish">{item.label}</td><td>{periodTitle}</td><td><strong>{item.value}</strong></td><td>{item.detail}</td></tr>)}
@@ -2259,6 +2592,13 @@ function expenseCategoryLabel(category: string) {
   return expenseCategoryLabels[category as ExpenseCategory] ?? category;
 }
 
+const supplierPaymentTermLabels: Record<NonNullable<Supplier["paymentTerms"]>, string> = {
+  Immediate: "Pay Immediately",
+  "Net 7": "Pay within 7 days",
+  "Net 15": "Pay within 15 days",
+  "Net 30": "Pay within 30 days",
+};
+
 const paymentLabels: Record<PaymentMode, string> = {
   cash: "Cash",
   bank_transfer: "Bank Transfer",
@@ -2275,9 +2615,104 @@ function nextCode(prefix: string, items: Array<{ id: string }>) {
   return `${prefix}-${String(max + 1).padStart(4, "0")}`;
 }
 
+function ProcurementScreen() {
+  const { suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, purchaseBills, setPurchaseBills, products, setProducts, staff, setStockMovements, setLedgerEntries, showToast } = useApp();
+  const [tab, setTab] = useHashTab(["suppliers", "purchase-orders", "purchase-bills"] as const, "suppliers");
+  const [supplierOpen, setSupplierOpen] = useState(false);
+  const [supplierEditing, setSupplierEditing] = useState<Supplier | null>(null);
+  const [poOpen, setPoOpen] = useState(false);
+  const [poEditing, setPoEditing] = useState<PurchaseOrder | null>(null);
+  const [receiving, setReceiving] = useState<PurchaseOrder | null>(null);
+  const [billOpen, setBillOpen] = useState(false);
+  const [billEditing, setBillEditing] = useState<PurchaseBill | null>(null);
+  const [poStatusFilter, setPoStatusFilter] = useState<"all" | POStatus>("all");
+  const [poSupplierFilter, setPoSupplierFilter] = useState("all");
+  const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
+  const access = roleAccess(currentUser.role);
+  const now = new Date();
+  const ordersThisMonth = purchaseOrders.filter((po) => new Date(po.orderDate).getMonth() === now.getMonth() && new Date(po.orderDate).getFullYear() === now.getFullYear()).length;
+  const totalPayable = purchaseBills.reduce((sum, bill) => sum + bill.balanceDue, 0);
+  const paidThisMonth = purchaseBills.filter((bill) => bill.paymentDate && new Date(bill.paymentDate).getMonth() === now.getMonth() && new Date(bill.paymentDate).getFullYear() === now.getFullYear()).reduce((sum, bill) => sum + bill.amountPaid, 0);
+  const pendingBills = purchaseBills.filter((bill) => bill.balanceDue > 0).length;
+  const overdueBills = purchaseBills.filter((bill) => bill.balanceDue > 0 && bill.dueDate && new Date(bill.dueDate) < now).length;
+  const statRows = tab === "suppliers"
+    ? [["Total suppliers", suppliers.length], ["Orders this month", ordersThisMonth], ["Total payable", INR.format(totalPayable)], ["Paid this month", INR.format(paidThisMonth)]]
+    : tab === "purchase-orders"
+      ? [["Draft", purchaseOrders.filter((po) => po.status === "draft").length], ["Sent", purchaseOrders.filter((po) => po.status === "sent").length], ["Received", purchaseOrders.filter((po) => po.status === "received").length], ["Cancelled", purchaseOrders.filter((po) => po.status === "cancelled").length]]
+      : [["Total payable", INR.format(totalPayable)], ["Paid this month", INR.format(paidThisMonth)], ["Pending bills", pendingBills], ["Overdue", overdueBills]];
+  const newLabel = tab === "suppliers" ? "New supplier" : tab === "purchase-orders" ? "New order" : "New bill";
+  const filteredPurchaseOrders = purchaseOrders.filter((po) => (poStatusFilter === "all" || po.status === poStatusFilter) && (poSupplierFilter === "all" || po.supplierId === poSupplierFilter));
+  const openNew = () => {
+    if (tab === "suppliers") { setSupplierEditing(null); setSupplierOpen(true); }
+    if (tab === "purchase-orders") { setPoEditing(null); setPoOpen(true); }
+    if (tab === "purchase-bills") { setBillEditing(null); setBillOpen(true); }
+  };
+  const confirmBill = (bill: PurchaseBill) => {
+    const status: PurchaseBill["status"] = bill.balanceDue <= 0 ? "paid" : bill.amountPaid > 0 ? "partial_paid" : "confirmed";
+    const confirmed = { ...bill, status };
+    const stockUpdate = applyPurchaseBillStock(products, confirmed);
+    setProducts(stockUpdate.products as Product[]);
+    setStockMovements((items) => [...stockUpdate.movements, ...items]);
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createBillLedgerEntries(confirmed)));
+    setPurchaseBills((items) => items.map((item) => item.id === bill.id ? confirmed : item));
+    showToast(`${bill.billNo} confirmed`);
+  };
+  const markPaid = (bill: PurchaseBill) => {
+    const paymentAmount = bill.balanceDue;
+    const amountPaid = Math.min(bill.grandTotal, bill.amountPaid + paymentAmount);
+    const updated: PurchaseBill = { ...bill, amountPaid, balanceDue: Math.max(0, bill.grandTotal - amountPaid), status: "paid", paymentDate: new Date().toISOString(), paymentMode: bill.paymentMode ?? "bank_transfer" };
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createBillPaymentLedgerEntries(updated, paymentAmount)));
+    setPurchaseBills((items) => items.map((item) => item.id === bill.id ? updated : item));
+    showToast(`${bill.billNo} marked paid`);
+  };
+  const savePurchaseBill = (bill: PurchaseBill) => {
+    setPurchaseBills((items) => billEditing ? items.map((item) => item.id === billEditing.id ? bill : item) : [bill, ...items]);
+    setLedgerEntries((items) => {
+      const withoutBill = items.filter((entry) => entry.referenceId !== bill.id && entry.referenceId !== bill.billNo);
+      const entries = [createPurchaseBillSummaryLedgerEntry(bill)];
+      return entriesWithRunningBalance(withoutBill, entries);
+    });
+    setBillOpen(false);
+    showToast(`${bill.billNo} saved`);
+  };
+
+  return (
+    <section className="page tab-page">
+      <PageHeader title="Procurement" subtitle="Manage suppliers, purchase orders, and purchased bills." action={<button className="primary" onClick={openNew}><Plus size={16} />{newLabel}</button>} />
+      <div className="tab-bar"><button className={tab === "suppliers" ? "active" : ""} onClick={() => setTab("suppliers")}>Suppliers</button><button className={tab === "purchase-orders" ? "active" : ""} onClick={() => setTab("purchase-orders")}>Purchase orders</button><button className={tab === "purchase-bills" ? "active" : ""} onClick={() => setTab("purchase-bills")}>Purchased Bills</button></div>
+      <div className="cashflow-grid procurement-stats summary-fade">{statRows.map(([label, value]) => <div className="card cash-card" key={label}><span>{label}</span><strong>{value}</strong><small>{tab === "purchase-bills" ? "purchased bills" : tab.replace("-", " ")}</small></div>)}</div>
+      {tab === "suppliers" ? <DataTable headers={["Name", "Contact", "Phone", "GSTIN", "Orders", "Balance", "Actions"]}>{suppliers.length ? suppliers.map((supplier) => {
+        const orders = purchaseOrders.filter((po) => po.supplierId === supplier.id && po.status !== "cancelled");
+        const balance = purchaseBills.filter((bill) => bill.supplierId === supplier.id).reduce((sum, bill) => sum + bill.balanceDue, 0);
+        return <tr key={supplier.id}><td><strong>{supplier.name}</strong><small>{supplierPaymentTermLabels[supplier.paymentTerms ?? "Immediate"]}</small></td><td>{supplier.contactPerson || "-"}</td><td>{supplier.phone}</td><td>{supplier.gstin || "-"}</td><td>{orders.length}</td><td><strong>{INR.format(balance)}</strong></td><td className="actions"><button title="Edit" onClick={() => { setSupplierEditing(supplier); setSupplierOpen(true); }}><Pencil size={16} /></button>{access.canDeleteSuppliers ? <button title="Delete" onClick={() => { setSuppliers((items) => items.filter((item) => item.id !== supplier.id)); showToast("Supplier deleted"); }}><Trash2 size={16} /></button> : null}</td></tr>;
+      }) : <tr><td className="empty-table" colSpan={7}>No Data Available</td></tr>}</DataTable> : null}
+      {tab === "purchase-orders" ? <>
+        <div className="po-header-toolbar procurement-filter-row"><select className="filter-select" value={poStatusFilter} onChange={(event) => setPoStatusFilter(event.target.value as "all" | POStatus)}><option value="all">All Status</option><option value="draft">Draft</option><option value="sent">Sent</option><option value="partial">Partial</option><option value="received">Received</option><option value="cancelled">Cancelled</option></select><select className="filter-select" value={poSupplierFilter} onChange={(event) => setPoSupplierFilter(event.target.value)}><option value="all">All Suppliers</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></div>
+        <DataTable headers={["PO No.", "Date", "Supplier", "Items", "Total", "Status", "Actions"]}>{filteredPurchaseOrders.length ? filteredPurchaseOrders.map((po) => <tr key={po.id}><td className="linkish">{po.id}</td><td>{formatDate(po.orderDate)}</td><td>{po.supplierName}</td><td>{po.items.length} items</td><td><strong>{INR.format(po.grandTotal)}</strong></td><td><span className={`po-status ${po.status}`}>{po.status}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setPoEditing(po); setPoOpen(true); }}><Eye size={16} /></button>{po.status !== "received" && po.status !== "cancelled" ? <button title="Receive Goods" onClick={() => setReceiving(po)}><PackagePlus size={16} /></button> : null}<button title="Cancel" onClick={() => setPurchaseOrders((items) => items.map((item) => item.id === po.id ? { ...item, status: "cancelled", updatedAt: new Date().toISOString() } : item))}><Trash2 size={16} /></button></td></tr>) : <tr><td className="empty-table" colSpan={7}>No Data Available</td></tr>}</DataTable>
+      </> : null}
+      {tab === "purchase-bills" ? <DataTable headers={["Bill No", "Date", "Supplier", "Invoice No", "Total", "Paid", "Paid On", "Balance", "Status", "Actions"]}>{purchaseBills.length ? purchaseBills.map((bill) => {
+        const displayStatus = purchaseBillDisplayStatus(bill);
+        return <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td>{bill.paymentDate && (displayStatus === "paid" || displayStatus === "partial") ? formatDate(bill.paymentDate) : "-"}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${displayStatus}`}>{purchaseBillStatusLabel(displayStatus)}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setBillEditing(bill); setBillOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => setPurchaseBills((items) => items.filter((item) => item.id !== bill.id))}><Trash2 size={16} /></button></td></tr>;
+      }) : <tr><td className="empty-table" colSpan={10}>No Data Available</td></tr>}</DataTable> : null}
+      {supplierOpen ? <SupplierModal supplier={supplierEditing} onClose={() => setSupplierOpen(false)} onSave={(supplier) => { setSuppliers((items) => supplierEditing ? items.map((item) => item.id === supplierEditing.id ? supplier : item) : [supplier, ...items]); showToast(supplierEditing ? "Supplier updated" : "Supplier added"); setSupplierOpen(false); }} /> : null}
+      {poOpen ? <PurchaseOrderModal po={poEditing} products={products} suppliers={suppliers} purchaseOrders={purchaseOrders} onClose={() => setPoOpen(false)} onSave={(po) => { setPurchaseOrders((items) => poEditing ? items.map((item) => item.id === poEditing.id ? po : item) : [po, ...items]); showToast(`${po.id} saved`); setPoOpen(false); }} /> : null}
+      {billOpen ? <PurchaseBillModal bill={billEditing} bills={purchaseBills} purchaseOrders={purchaseOrders} suppliers={suppliers} products={products} onClose={() => setBillOpen(false)} onSave={savePurchaseBill} /> : null}
+      {receiving ? <ReceiveGoodsModal po={receiving} onClose={() => setReceiving(null)} onReceive={(received) => {
+        let updatedCount = 0;
+        setPurchaseOrders((items) => items.map((po) => po.id !== receiving.id ? po : { ...po, items: po.items.map((item) => { const addQty = received[item.id] ?? 0; if (addQty > 0) updatedCount += 1; return { ...item, receivedQty: Math.min(item.orderedQty, item.receivedQty + addQty) }; }), updatedAt: new Date().toISOString() }));
+        setProducts((items) => items.map((product) => { const poItem = receiving.items.find((item) => item.productId === product.id); const addQty = poItem ? received[poItem.id] ?? 0 : 0; return addQty > 0 ? { ...product, stock: product.stock + addQty, costPrice: poItem?.unitCost } : product; }));
+        showToast(`Stock updated for ${updatedCount} products`);
+        setReceiving(null);
+      }} /> : null}
+    </section>
+  );
+}
+
 function SuppliersScreen() {
-  const { suppliers, setSuppliers, purchaseOrders, showToast } = useApp();
+  const { suppliers, setSuppliers, purchaseOrders, staff, showToast } = useApp();
   const navigate = useNavigate();
+  const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
+  const access = roleAccess(currentUser.role);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<Supplier | null>(null);
   const [open, setOpen] = useState(false);
@@ -2291,8 +2726,8 @@ function SuppliersScreen() {
         {rows.length ? rows.map((supplier) => {
           const orders = purchaseOrders.filter((po) => po.supplierId === supplier.id && po.status !== "cancelled");
           const balance = orders.filter((po) => po.status !== "received").reduce((sum, po) => sum + po.grandTotal, 0);
-          return <tr key={supplier.id}><td><strong>{supplier.name}</strong><small>{supplier.paymentTerms ?? "Immediate"}</small></td><td>{supplier.contactPerson || "-"}</td><td>{supplier.phone}</td><td>{supplier.gstin || "-"}</td><td>{orders.length}</td><td><strong>{INR.format(balance)}</strong></td><td className="actions"><button title="Edit" onClick={() => { setEditing(supplier); setOpen(true); }}><Pencil size={16} /></button><button title="View Orders" onClick={() => navigate("/purchase-orders")}><Eye size={16} /></button><button title="Delete" onClick={() => { setSuppliers((items) => items.filter((item) => item.id !== supplier.id)); showToast("Supplier deleted"); }}><Trash2 size={16} /></button></td></tr>;
-        }) : <tr><td colSpan={7}><div className="empty compact">No suppliers added yet. Add your first supplier.</div></td></tr>}
+          return <tr key={supplier.id}><td><strong>{supplier.name}</strong><small>{supplierPaymentTermLabels[supplier.paymentTerms ?? "Immediate"]}</small></td><td>{supplier.contactPerson || "-"}</td><td>{supplier.phone}</td><td>{supplier.gstin || "-"}</td><td>{orders.length}</td><td><strong>{INR.format(balance)}</strong></td><td className="actions"><button title="Edit" onClick={() => { setEditing(supplier); setOpen(true); }}><Pencil size={16} /></button><button title="View Orders" onClick={() => navigate("/purchase-orders")}><Eye size={16} /></button>{access.canDeleteSuppliers ? <button title="Delete" onClick={() => { setSuppliers((items) => items.filter((item) => item.id !== supplier.id)); showToast("Supplier deleted"); }}><Trash2 size={16} /></button> : null}</td></tr>;
+        }) : <tr><td className="empty-table" colSpan={7}>No Data Available</td></tr>}
       </DataTable>
       {open ? <SupplierModal supplier={editing} onClose={() => setOpen(false)} onSave={(supplier) => {
         setSuppliers((items) => editing ? items.map((item) => item.id === editing.id ? supplier : item) : [supplier, ...items]);
@@ -2312,7 +2747,7 @@ function SupplierModal({ supplier, onClose, onSave }: { supplier: Supplier | nul
       <div className="modal-head"><div><h2>{supplier ? "Edit Supplier" : "Add Supplier"}</h2><p>Supplier profile and payment details.</p></div><button onClick={onClose}><X size={20} /></button></div>
       <div className="form-grid two"><TextField label="Supplier Name" value={form.name} onChange={(value) => update("name", value)} /><TextField label="Contact Person" value={form.contactPerson ?? ""} onChange={(value) => update("contactPerson", value)} /></div>
       <div className="form-grid two"><TextField label="Phone" value={form.phone} onChange={(value) => update("phone", value)} /><TextField label="Email" type="email" value={form.email ?? ""} onChange={(value) => update("email", value)} /></div>
-      <div className="form-grid two"><TextField label="GSTIN" value={form.gstin ?? ""} onChange={(value) => update("gstin", value.toUpperCase().slice(0, 15))} /><label className="field"><span>Payment Terms</span><select value={form.paymentTerms ?? "Immediate"} onChange={(event) => update("paymentTerms", event.target.value as Supplier["paymentTerms"])}><option>Immediate</option><option>Net 7</option><option>Net 15</option><option>Net 30</option></select></label></div>
+      <div className="form-grid two"><TextField label="GSTIN" value={form.gstin ?? ""} onChange={(value) => update("gstin", value.toUpperCase().slice(0, 15))} /><label className="field"><span className="label-with-info">Payment Terms <span className="info-icon" title="Payment Terms define how many days the supplier allows before payment is due">ⓘ</span></span><select value={form.paymentTerms ?? "Immediate"} onChange={(event) => update("paymentTerms", event.target.value as Supplier["paymentTerms"])}>{Object.entries(supplierPaymentTermLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div>
       <label className="field"><span>Address</span><textarea value={form.address ?? ""} onChange={(event) => update("address", event.target.value)} placeholder="Supplier address" /></label>
       <label className="field"><span>Notes</span><textarea value={form.notes ?? ""} onChange={(event) => update("notes", event.target.value)} placeholder="Internal notes" /></label>
       <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!valid} onClick={() => valid && onSave({ ...form, name: form.name.trim(), phone: form.phone.trim() })}>Save Supplier</button></div>
@@ -2333,7 +2768,7 @@ function PurchaseOrdersScreen() {
     <section className="page purchase-orders-page">
       <div className="po-page-header"><div className="po-header-top"><div><h1>Purchase Orders</h1><p>Track stock procurement from suppliers.</p></div><button className="primary po-new-button" onClick={() => { setEditing(null); setOpen(true); }}><span>+</span><span>New PO</span></button></div><div className="po-header-toolbar"><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value as "all" | POStatus)}><option value="all">All Status</option><option value="draft">Draft</option><option value="sent">Sent</option><option value="partial">Partial</option><option value="received">Received</option><option value="cancelled">Cancelled</option></select><select className="filter-select" value={supplierId} onChange={(event) => setSupplierId(event.target.value)}><option value="all">All Suppliers</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></div></div>
       <DataTable headers={["PO No.", "Date", "Supplier", "Items", "Total", "Status", "Actions"]}>
-        {rows.map((po) => <tr key={po.id}><td className="linkish">{po.id}</td><td>{new Date(po.orderDate).toLocaleDateString("en-IN")}</td><td>{po.supplierName}</td><td>{po.items.length} items</td><td><strong>{INR.format(po.grandTotal)}</strong></td><td><span className={`po-status ${po.status}`}>{po.status}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(po); setOpen(true); }}><Eye size={16} /></button>{po.status === "draft" ? <button title="Edit Draft" onClick={() => { setEditing(po); setOpen(true); }}><Edit size={16} /></button> : null}{po.status !== "received" && po.status !== "cancelled" ? <button title="Receive Goods" onClick={() => setReceiving(po)}><PackagePlus size={16} /></button> : null}<button title="Cancel" onClick={() => setPurchaseOrders((items) => items.map((item) => item.id === po.id ? { ...item, status: "cancelled", updatedAt: new Date().toISOString() } : item))}><Trash2 size={16} /></button></td></tr>)}
+        {rows.length ? rows.map((po) => <tr key={po.id}><td className="linkish">{po.id}</td><td>{formatDate(po.orderDate)}</td><td>{po.supplierName}</td><td>{po.items.length} items</td><td><strong>{INR.format(po.grandTotal)}</strong></td><td><span className={`po-status ${po.status}`}>{po.status}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(po); setOpen(true); }}><Eye size={16} /></button>{po.status === "draft" ? <button title="Edit Draft" onClick={() => { setEditing(po); setOpen(true); }}><Edit size={16} /></button> : null}{po.status !== "received" && po.status !== "cancelled" ? <button title="Receive Goods" onClick={() => setReceiving(po)}><PackagePlus size={16} /></button> : null}<button title="Cancel" onClick={() => setPurchaseOrders((items) => items.map((item) => item.id === po.id ? { ...item, status: "cancelled", updatedAt: new Date().toISOString() } : item))}><Trash2 size={16} /></button></td></tr>) : <tr><td className="empty-table" colSpan={7}>No Data Available</td></tr>}
       </DataTable>
       {open ? <PurchaseOrderModal po={editing} products={products} suppliers={suppliers} purchaseOrders={purchaseOrders} onClose={() => setOpen(false)} onSave={(po) => {
         setPurchaseOrders((items) => editing ? items.map((item) => item.id === editing.id ? po : item) : [po, ...items]);
@@ -2362,6 +2797,158 @@ function PurchaseOrdersScreen() {
         setReceiving(null);
       }} /> : null}
     </section>
+  );
+}
+
+function PurchaseBillsScreen() {
+  const { purchaseBills, setPurchaseBills, purchaseOrders, suppliers, products, setProducts, setStockMovements, setLedgerEntries, showToast } = useApp();
+  const [status, setStatus] = useState<PurchaseBill["status"] | "all">("all");
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<PurchaseBill | null>(null);
+  const rows = purchaseBills.filter((bill) => status === "all" || bill.status === status);
+  const now = new Date();
+  const totalPayable = purchaseBills.reduce((sum, bill) => sum + bill.balanceDue, 0);
+  const paidThisMonth = purchaseBills.filter((bill) => bill.paymentDate && new Date(bill.paymentDate).getMonth() === now.getMonth() && new Date(bill.paymentDate).getFullYear() === now.getFullYear()).reduce((sum, bill) => sum + bill.amountPaid, 0);
+  const pendingBills = purchaseBills.filter((bill) => bill.balanceDue > 0).length;
+  const overdueBills = purchaseBills.filter((bill) => bill.balanceDue > 0 && bill.dueDate && new Date(bill.dueDate) < now).length;
+
+  function saveBill(bill: PurchaseBill) {
+    setPurchaseBills((items) => editing ? items.map((item) => item.id === editing.id ? bill : item) : [bill, ...items]);
+    setLedgerEntries((items) => {
+      const withoutBill = items.filter((entry) => entry.referenceId !== bill.id && entry.referenceId !== bill.billNo);
+      const entries = [createPurchaseBillSummaryLedgerEntry(bill)];
+      return entriesWithRunningBalance(withoutBill, entries);
+    });
+    setOpen(false);
+    setEditing(null);
+    showToast(`${bill.billNo} saved`);
+  }
+
+  function confirmBill(bill: PurchaseBill) {
+    const status: PurchaseBill["status"] = bill.balanceDue <= 0 ? "paid" : bill.amountPaid > 0 ? "partial_paid" : "confirmed";
+    const confirmed = { ...bill, status };
+    const stockUpdate = applyPurchaseBillStock(products, confirmed);
+    setProducts(stockUpdate.products as Product[]);
+    setStockMovements((items) => [...stockUpdate.movements, ...items]);
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createBillLedgerEntries(confirmed)));
+    setPurchaseBills((items) => items.map((item) => item.id === bill.id ? confirmed : item));
+    showToast(`${bill.billNo} confirmed`);
+  }
+
+  function markPaid(bill: PurchaseBill) {
+    const paymentAmount = bill.balanceDue;
+    const amountPaid = Math.min(bill.grandTotal, bill.amountPaid + paymentAmount);
+    const updated: PurchaseBill = { ...bill, amountPaid, balanceDue: Math.max(0, bill.grandTotal - amountPaid), status: "paid", paymentDate: new Date().toISOString(), paymentMode: bill.paymentMode ?? "bank_transfer" };
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createBillPaymentLedgerEntries(updated, paymentAmount)));
+    setPurchaseBills((items) => items.map((item) => item.id === bill.id ? updated : item));
+    showToast(`${bill.billNo} marked paid`);
+  }
+
+  return (
+    <section className="page">
+      <PageHeader title="Purchase Bills" subtitle="Record supplier invoices and manage payables" action={<div className="toolbar"><select value={status} onChange={(event) => setStatus(event.target.value as PurchaseBill["status"] | "all")}><option value="all">All</option><option value="draft">Draft</option><option value="confirmed">Confirmed</option><option value="paid">Paid</option><option value="partial_paid">Partial Paid</option></select><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />New Bill</button></div>} />
+      <div className="cashflow-grid"><div className="card cash-card"><span>Total Payable</span><strong className="red-text">{INR.format(totalPayable)}</strong><small>Money owed</small></div><div className="card cash-card"><span>Paid This Month</span><strong className="green-text">{INR.format(paidThisMonth)}</strong><small>Supplier payments</small></div><div className="card cash-card"><span>Pending Bills</span><strong>{pendingBills}</strong><small>Bills with balance</small></div><div className="card cash-card"><span>Overdue Bills</span><strong className="red-text">{overdueBills}</strong><small>Past due date</small></div></div>
+      <DataTable headers={["Bill No", "Date", "Supplier", "Invoice No", "Total", "Paid", "Balance", "Status", "Actions"]}>
+        {rows.length ? rows.map((bill) => <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${bill.status === "partial_paid" ? "partial" : bill.status}`}>{bill.status.replace("_", " ")}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(bill); setOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => setPurchaseBills((items) => items.filter((item) => item.id !== bill.id))}><Trash2 size={16} /></button></td></tr>) : <tr><td className="empty-table" colSpan={9}>No Data Available</td></tr>}
+      </DataTable>
+      {open ? <PurchaseBillModal bill={editing} bills={purchaseBills} purchaseOrders={purchaseOrders} suppliers={suppliers} products={products} onClose={() => setOpen(false)} onSave={saveBill} /> : null}
+    </section>
+  );
+}
+
+function PurchaseBillModal({ bill, bills, purchaseOrders, suppliers, products, onClose, onSave }: { bill: PurchaseBill | null; bills: PurchaseBill[]; purchaseOrders: PurchaseOrder[]; suppliers: Supplier[]; products: Product[]; onClose: () => void; onSave: (bill: PurchaseBill) => void }) {
+  const [supplierId, setSupplierId] = useState(bill?.supplierId ?? suppliers[0]?.id ?? "");
+  const [supplierName, setSupplierName] = useState(bill?.supplierName ?? suppliers[0]?.name ?? "");
+  const [supplierInvoiceNo, setSupplierInvoiceNo] = useState(bill?.supplierInvoiceNo ?? "");
+  const [linkedPOId, setLinkedPOId] = useState(bill?.linkedPOId ?? "");
+  const [billDate, setBillDate] = useState(dateKey(bill?.billDate ?? new Date().toISOString()));
+  const [dueDate, setDueDate] = useState(bill?.dueDate ? dateKey(bill.dueDate) : "");
+  const [notes, setNotes] = useState(bill?.notes ?? "");
+  const [amountPaid, setAmountPaid] = useState(String(bill?.amountPaid ?? 0));
+  const [paymentMode, setPaymentMode] = useState<PurchaseBillPaymentMode>(bill?.paymentMode ?? "credit");
+  const [paymentStatus, setPaymentStatus] = useState<PurchaseBillPaymentStatus>(bill?.paymentStatus ?? (bill?.status === "paid" ? "paid" : bill?.status === "partial_paid" ? "partial" : "unpaid"));
+  const [paidOn, setPaidOn] = useState(bill?.paymentDate ? dateKey(bill.paymentDate) : "");
+  const [paidVia, setPaidVia] = useState<PurchaseBillPaidVia>(bill?.paidVia ?? (bill?.paymentMode && bill.paymentMode !== "credit" ? bill.paymentMode : ""));
+  const [items, setItems] = useState<PurchaseBillItem[]>(bill?.items ?? (products[0] ? [buildPurchaseBillItem(products[0], 1, products[0].costPrice ?? products[0].price * 0.65)] : []));
+  const supplier = suppliers.find((item) => item.id === supplierId);
+  const totals = totalsForPurchaseBill(items);
+  const paid = paymentStatus === "paid" ? totals.grandTotal : paymentStatus === "unpaid" ? 0 : Math.min(totals.grandTotal, Number(amountPaid) || 0);
+  const autoReminderDates = dueDate && paymentStatus !== "paid" ? [15, 10, 5].map((days) => {
+    const reminderDate = new Date(dueDate);
+    reminderDate.setDate(reminderDate.getDate() - days);
+    return { days, date: reminderDate };
+  }) : [];
+
+  function linkPO(poId: string) {
+    setLinkedPOId(poId);
+    const po = purchaseOrders.find((item) => item.id === poId);
+    if (!po) return;
+    setSupplierId(po.supplierId);
+    setSupplierName(po.supplierName);
+    setItems(po.items.map((item) => ({
+      id: crypto.randomUUID(),
+      productId: item.productId,
+      productName: item.productName,
+      sku: item.sku,
+      quantity: item.receivedQty || item.orderedQty,
+      unit: "piece",
+      unitCost: item.unitCost,
+      gstRate: item.gstRate,
+      cgst: item.cgst,
+      sgst: item.sgst,
+      igst: item.igst,
+      lineTotal: item.lineTotal,
+      updateStock: true,
+    })));
+  }
+
+  function updateItem(id: string, patch: Partial<PurchaseBillItem>) {
+    setItems((current) => current.map((item) => {
+      if (item.id !== id) return item;
+      const merged = { ...item, ...patch };
+      const taxable = merged.quantity * merged.unitCost;
+      const gst = taxable * (merged.gstRate / 100);
+      return { ...merged, cgst: gst / 2, sgst: gst / 2, igst: 0, lineTotal: taxable + gst };
+    }));
+  }
+
+  function selectProduct(id: string, productId: string) {
+    const product = products.find((item) => item.id === productId);
+    if (!product) return;
+    setItems((current) => current.map((item) => item.id === id ? { ...buildPurchaseBillItem(product, item.quantity, product.costPrice ?? product.price * 0.65), id } : item));
+  }
+
+  function save(status: PurchaseBill["status"]) {
+    const vendor = supplier?.name ?? supplierName.trim();
+    if (!vendor || !items.length) return;
+    const paymentDrivenStatus: PurchaseBill["status"] = status === "draft" ? "draft" : paymentStatus === "paid" ? "paid" : paymentStatus === "partial" ? "partial_paid" : "confirmed";
+    const paymentDate = paid > 0 ? new Date(paidOn || new Date().toISOString()).toISOString() : undefined;
+    onSave({ id: bill?.id ?? crypto.randomUUID(), billNo: bill?.billNo ?? `BILL-${String(bills.length + 1).padStart(4, "0")}`, supplierId: supplier?.id, supplierName: vendor, supplierGSTIN: supplier?.gstin, supplierInvoiceNo, linkedPOId: linkedPOId || undefined, status: paymentDrivenStatus, items, ...totals, amountPaid: paid, balanceDue: Math.max(0, totals.grandTotal - paid), billDate: new Date(billDate).toISOString(), dueDate: dueDate ? new Date(dueDate).toISOString() : undefined, paymentMode: paidVia && paidVia !== "card" ? paidVia : paymentMode, paymentDate, paymentStatus, paidVia, reminders: autoReminderDates.map((reminder) => ({ days: reminder.days, date: reminder.date.toISOString(), triggered: false })), notes, createdBy: "Admin Owner", createdAt: bill?.createdAt ?? new Date().toISOString() });
+  }
+
+  return (
+    <Modal onClose={onClose} className="wide-modal">
+      <div className="modal-head"><div><h2>{bill ? bill.billNo : "New Purchase Bill"}</h2><p>Supplier invoice, stock update, and payment tracking.</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="form-grid three"><label className="field"><span>Supplier</span><select value={supplierId} onChange={(event) => { setSupplierId(event.target.value); setSupplierName(suppliers.find((item) => item.id === event.target.value)?.name ?? ""); }}><option value="">Free text supplier</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></label><TextField label="Supplier Invoice No" value={supplierInvoiceNo} onChange={setSupplierInvoiceNo} /><label className="field"><span>Link to Purchase Order</span><select value={linkedPOId} onChange={(event) => linkPO(event.target.value)}><option value="">No linked PO</option>{purchaseOrders.map((po) => <option key={po.id} value={po.id}>{po.id} · {po.supplierName}</option>)}</select></label></div>
+      {!supplierId ? <TextField label="Supplier Name" value={supplierName} onChange={setSupplierName} /> : null}
+      {linkedPOId ? <div className="demo-box">Imported from {linkedPOId}</div> : null}
+      <div className="form-grid three"><TextField label="Bill Date" type="date" value={billDate} onChange={setBillDate} /><TextField label="Due Date" type="date" value={dueDate} onChange={setDueDate} /><TextField label="Amount Paid" type="number" value={amountPaid} onChange={setAmountPaid} /></div>
+      <div className="form-grid three">
+        <label className="field"><span>Payment Status *</span><select value={paymentStatus} onChange={(event) => setPaymentStatus(event.target.value as PurchaseBillPaymentStatus)}><option value="unpaid">Unpaid</option><option value="partial">Partially Paid</option><option value="paid">Paid</option></select></label>
+        {paymentStatus === "paid" || paymentStatus === "partial" ? <TextField label="Paid On" type="date" value={paidOn} onChange={setPaidOn} /> : <div />}
+        {paymentStatus === "paid" || paymentStatus === "partial" ? <label className="field"><span>Paid Via</span><select value={paidVia} onChange={(event) => setPaidVia(event.target.value as PurchaseBillPaidVia)}><option value="">Select method</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="upi">UPI</option><option value="cheque">Cheque</option><option value="card">Card</option></select></label> : <div />}
+      </div>
+      {paymentStatus === "partial" ? <div className="form-grid two"><TextField label="Amount Paid (₹)" type="number" value={amountPaid} onChange={setAmountPaid} /><label className="field"><span>Balance Due (₹)</span><input type="number" readOnly value={Math.max(0, totals.grandTotal - paid).toFixed(2)} /></label></div> : null}
+      <label className="field"><span>Payment Mode</span><select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value as PurchaseBillPaymentMode)}><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="upi">UPI</option><option value="cheque">Cheque</option><option value="credit">Credit</option></select></label>
+      <div className="po-items"><div className="po-items-head"><strong>Items</strong><button className="outline" onClick={() => products[0] && setItems((current) => [...current, buildPurchaseBillItem(products[0], 1, products[0].costPrice ?? products[0].price * 0.65)])}>Add Item</button></div>{items.map((item) => <div className="po-item-row" key={item.id}><label><span>Product</span><select value={item.productId ?? ""} onChange={(event) => selectProduct(item.id, event.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label><label><span>Qty</span><input type="number" min="0" value={item.quantity} onChange={(event) => updateItem(item.id, { quantity: Number(event.target.value) || 0 })} /></label><label><span>Unit</span><input value={item.unit} onChange={(event) => updateItem(item.id, { unit: event.target.value })} /></label><label><span>Unit Cost</span><input type="number" min="0" value={item.unitCost} onChange={(event) => updateItem(item.id, { unitCost: Number(event.target.value) || 0 })} /></label><label><span>GST %</span><select value={item.gstRate} onChange={(event) => updateItem(item.id, { gstRate: Number(event.target.value) })}><option value={0}>0</option><option value={5}>5</option><option value={12}>12</option><option value={18}>18</option><option value={28}>28</option></select></label><label className="stock-checkbox-field"><span>Update Stock</span><input type="checkbox" checked={item.updateStock} onChange={(event) => updateItem(item.id, { updateStock: event.target.checked })} /></label><strong>{INR.format(item.lineTotal)}</strong><button className="danger-light" onClick={() => setItems((current) => current.filter((row) => row.id !== item.id))}>Remove</button><small>CGST {INR.format(item.cgst)} · SGST {INR.format(item.sgst)}</small></div>)}</div>
+      <div className="totals-box"><span>Subtotal <strong>{INR.format(totals.subtotal)}</strong></span><span>Total GST <strong>{INR.format(totals.totalGST)}</strong></span><span>Grand Total <strong>{INR.format(totals.grandTotal)}</strong></span><span>Balance Due <strong>{INR.format(Math.max(0, totals.grandTotal - paid))}</strong></span></div>
+      {autoReminderDates.length ? <div className="payment-reminder-box auto-reminder-box"><div className="auto-reminder-title">Auto Payment Reminders Scheduled</div>{autoReminderDates.map((reminder) => {
+        const isPast = reminder.date < new Date();
+        return <div className={`auto-reminder-row ${isPast ? "past" : ""}`} key={reminder.days}><span>{reminder.days} days before due ({formatDate(reminder.date)})</span><strong>{isPast ? "Passed" : "Scheduled"}</strong></div>;
+      })}<div className="auto-reminder-foot">Due: {formatDate(dueDate)} · Balance: {INR.format(Math.max(0, totals.grandTotal - paid))}</div></div> : null}
+      <label className="field"><span>Notes</span><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
+      <div className="modal-actions"><button className="outline" onClick={onClose}>Cancel</button><button className="outline" onClick={() => save("draft")}>Save as Draft</button><button className="primary" onClick={() => save(paid >= totals.grandTotal ? "paid" : paid > 0 ? "partial_paid" : "confirmed")}>Confirm Bill</button></div>
+    </Modal>
   );
 }
 
@@ -2414,7 +3001,7 @@ function ReceiveGoodsModal({ po, onClose, onReceive }: { po: PurchaseOrder; onCl
 }
 
 function ExpensesScreen() {
-  const { expenses, setExpenses, showToast } = useApp();
+  const { expenses, setExpenses, setLedgerEntries, showToast } = useApp();
   const [mode, setMode] = useState<DateRangeMode>("month");
   const [customFrom, setCustomFrom] = useState(dateKey(new Date().toISOString()));
   const [customTo, setCustomTo] = useState(dateKey(new Date().toISOString()));
@@ -2439,10 +3026,11 @@ function ExpensesScreen() {
       <div className="report-grid"><div className="card"><h2>Category Breakdown</h2><div className="category-breakdown">{byCategory.map(([name, amount]) => <div className="category-row-item" key={name}><div><strong>{expenseCategoryLabel(name)}</strong><span>{Math.round((amount / Math.max(total, 1)) * 100)}%</span></div><div className="progress"><i style={{ width: `${Math.round((amount / Math.max(total, 1)) * 100)}%` }} /></div><b>{INR.format(amount)}</b></div>)}</div></div><div className="card chart-card"><h2>Monthly Expense Trend</h2><RevenueChart data={monthlyExpenseData} xKey="month" height={260} /></div></div>
       <div className="section-head"><h2>All Expenses</h2><label className="field compact"><select value={category} onChange={(event) => setCategory(event.target.value as "all" | ExpenseCategory)}><option value="all">All Categories</option>{Object.entries(expenseCategoryLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
       <DataTable headers={["Date", "Description", "Category", "Vendor", "Amount", "Payment", "Actions"]}>
-        {periodExpenses.length ? periodExpenses.map((expense) => <tr key={expense.id}><td>{new Date(expense.date).toLocaleDateString("en-IN")}</td><td><strong>{expense.description}</strong><small>{expense.receiptNo ?? ""}</small></td><td><span className={`expense-badge ${expense.category}`}>{expenseCategoryLabel(expense.category)}</span></td><td>{expense.vendor ?? "-"}</td><td><strong>{INR.format(expense.amount)}</strong></td><td>{paymentLabels[expense.paymentMode]}</td><td className="actions"><button onClick={() => { setEditing(expense); setOpen(true); }}><Edit size={16} /></button><button onClick={() => { setExpenses((items) => items.filter((item) => item.id !== expense.id)); showToast("Expense deleted"); }}><Trash2 size={16} /></button></td></tr>) : <tr><td colSpan={7}><div className="empty compact">No expenses recorded. Add your first expense.</div></td></tr>}
+        {periodExpenses.length ? periodExpenses.map((expense) => <tr key={expense.id}><td>{formatDate(expense.date)}</td><td><strong>{expense.description}</strong><small>{expense.receiptNo ?? ""}</small></td><td><span className={`expense-badge ${expense.category}`}>{expenseCategoryLabel(expense.category)}</span></td><td>{expense.vendor ?? "-"}</td><td><strong>{INR.format(expense.amount)}</strong></td><td>{paymentLabels[expense.paymentMode]}</td><td className="actions"><button onClick={() => { setEditing(expense); setOpen(true); }}><Edit size={16} /></button><button onClick={() => { setExpenses((items) => items.filter((item) => item.id !== expense.id)); showToast("Expense deleted"); }}><Trash2 size={16} /></button></td></tr>) : <tr><td colSpan={7}><div className="empty compact">No expenses recorded. Add your first expense.</div></td></tr>}
       </DataTable>
       {open ? <ExpenseEditorModal expense={editing} expenses={expenses} onClose={() => setOpen(false)} onSave={(expense) => {
         setExpenses((items) => editing ? items.map((item) => item.id === editing.id ? expense : item) : [expense, ...items]);
+        setLedgerEntries((items) => entriesWithRunningBalance(items, createExpenseLedgerEntry(expense)));
         showToast(editing ? "Expense updated" : "Expense recorded");
         setOpen(false);
       }} /> : null}
@@ -2469,13 +3057,13 @@ function ExpenseEditorModal({ expense, expenses, onClose, onSave }: { expense: E
   );
 }
 
-function PnLScreen() {
-  const { invoices, purchaseOrders, expenses, products } = useApp();
+function PnLScreen({ embedded = false }: { embedded?: boolean }) {
+  const { invoices, purchaseOrders, purchaseBills, expenses, products } = useApp();
   const [mode, setMode] = useState<DateRangeMode>("month");
   const [customFrom, setCustomFrom] = useState(dateKey(new Date().toISOString()));
   const [customTo, setCustomTo] = useState(dateKey(new Date().toISOString()));
   const range = rangeBounds(mode, customFrom, customTo);
-  const report = computePnLFromData({ from: range.from, to: range.to, sales: invoices, purchases: purchaseOrders, expenses, products });
+  const report = computePnLFromData({ from: range.from, to: range.to, sales: invoices, purchases: purchaseOrders, purchaseBills, expenses, products });
   const pnlRows = [
     ["Gross Sales", report.grossRevenue],
     ["Less: Returns", -report.returnsValue],
@@ -2502,18 +3090,102 @@ function PnLScreen() {
     const rows = pnlRows.map(([label, amount]) => `<tr><td>${label}</td><td class="amount">${INR.format(Number(amount))}</td></tr>`).join("");
     const w = window.open("", "_blank");
     if (w) {
-      w.document.write(`<!doctype html><html><head><title>P&L Report</title><style>body{font-family:Inter,Arial,sans-serif;padding:32px;color:#111827}h1{font-size:22px}table{width:100%;border-collapse:collapse}td{padding:10px 12px;border-bottom:1px solid #E5E7EB}.amount{text-align:right;font-weight:700}</style></head><body><h1>Profit & Loss Report</h1><p>${range.from.toLocaleDateString("en-IN")} to ${range.to.toLocaleDateString("en-IN")}</p><table>${rows}</table></body></html>`);
+      w.document.write(`<!doctype html><html><head><title>P&L Report</title><style>body{font-family:Inter,Arial,sans-serif;padding:32px;color:#111827}h1{font-size:22px}table{width:100%;border-collapse:collapse}td{padding:10px 12px;border-bottom:1px solid #E5E7EB}.amount{text-align:right;font-weight:700}</style></head><body><h1>Profit & Loss Report</h1><p>${formatDate(range.from)} to ${formatDate(range.to)}</p><table>${rows}</table></body></html>`);
       w.document.close();
       w.print();
     }
   };
   return (
-    <section className="page pnl-page">
-      <PageHeader title="Profit & Loss" subtitle="Financial performance overview." action={<div className="toolbar-actions"><button className="outline" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary" onClick={exportPDF}>Export PDF</button></div>} />
-      <DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />
+    <section className={embedded ? "tab-page pnl-page" : "page pnl-page"}>
+      {!embedded ? <PageHeader title="Profit & Loss" subtitle="Financial performance overview." /> : null}
+      <div className="pnl-toolbar-row">
+        <DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />
+        <div className="pnl-export-actions"><button className="outline form-control" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary form-control" onClick={exportPDF}>Export PDF</button></div>
+      </div>
       <div className="pnl-kpi-row"><div className="card cash-card pnl-kpi-card"><span>Net Revenue</span><strong>{INR.format(report.netRevenue)}</strong><small>Sales minus returns</small></div><div className="card cash-card pnl-kpi-card"><span>Gross Profit</span><strong className={report.grossProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.grossProfit)}</strong><small>{report.grossMarginPct.toFixed(1)}% margin</small></div><div className="card cash-card pnl-kpi-card"><span>Total Expenses</span><strong>{INR.format(report.totalExpenses)}</strong><small>Operating spend</small></div><div className="card cash-card pnl-kpi-card"><span>Net Profit</span><strong className={report.netProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.netProfit)}</strong><small>{report.netMarginPct.toFixed(1)}% net margin</small></div></div>
       <div className="report-grid"><div className="card pnl-statement"><h2>P&L Statement</h2><StatementSection title="Revenue" rows={[["Gross Sales", report.grossRevenue], ["Less: Returns", -report.returnsValue], ["Net Revenue", report.netRevenue]]} /><StatementSection title="Cost of Goods Sold" rows={[["Purchases", report.purchasesValue], ["Closing Stock", report.closingStock], ["Cost of Goods Sold", report.cogs]]} /><StatementSection title="Operating Expenses" rows={[...report.expensesByCategory.map((item) => [expenseCategoryLabels[item.category as ExpenseCategory] ?? item.category, item.amount] as [string, number]), ["Total Expenses", report.totalExpenses]]} /><StatementSection title="GST Summary" rows={[["Output GST", report.outputGST], ["Input GST", -report.inputGST], ["Net GST Payable", report.netGSTPayable]]} /><div className={`statement-total ${report.netProfit >= 0 ? "profit" : "loss"}`}><span>Net Profit</span><strong>{INR.format(report.netProfit)}</strong></div></div><div className="card chart-card"><h2>Revenue vs Expenses</h2><ResponsiveContainer width="100%" height={300}><BarChart data={monthlyData.map((item, index) => ({ month: item.month, revenue: item.revenue, expenses: 500 + index * 120, profit: item.revenue - (500 + index * 120) }))} barCategoryGap="16%" margin={{ top: 10, right: 20, left: 0, bottom: 0 }}><CartesianGrid vertical={false} stroke="#E5E7EB" /><XAxis dataKey="month" /><YAxis tickFormatter={(value) => `₹${Number(value) / 1000}k`} /><Tooltip formatter={(value) => INR.format(Number(value))} /><Bar dataKey="revenue" fill="#2563EB" radius={[4, 4, 0, 0]} maxBarSize={52} /><Bar dataKey="expenses" fill="#EF4444" radius={[4, 4, 0, 0]} maxBarSize={52} /></BarChart></ResponsiveContainer></div></div>
     </section>
+  );
+}
+
+function FinancialsScreen() {
+  const [tab, setTab] = useHashTab(["balance-sheet", "pl", "ledger"] as const, "balance-sheet");
+  return (
+    <section className="page tab-page">
+      <PageHeader title="Financials" subtitle="Financial reports, position, and transaction history." />
+      <div className="tab-bar"><button className={tab === "balance-sheet" ? "active" : ""} onClick={() => setTab("balance-sheet")}>Balance sheet</button><button className={tab === "pl" ? "active" : ""} onClick={() => setTab("pl")}>P&L report</button><button className={tab === "ledger" ? "active" : ""} onClick={() => setTab("ledger")}>Ledger</button></div>
+      {tab === "balance-sheet" ? <BalanceSheetPanel /> : tab === "pl" ? <PnLScreen embedded /> : <LedgerPanel />}
+    </section>
+  );
+}
+
+function BalanceSheetScreen() {
+  return (
+    <section className="page">
+      <PageHeader title="Balance Sheet" subtitle="Financial position as of today" />
+      <BalanceSheetPanel />
+    </section>
+  );
+}
+
+function BalanceSheetPanel() {
+  const { invoices, purchaseOrders, purchaseBills, expenses, products } = useApp();
+  const [asOf, setAsOf] = useState(dateKey(new Date().toISOString()));
+  const statement = computeBalanceSheetFromData({ asOfDate: new Date(asOf), sales: invoices, purchaseOrders, purchaseBills, expenses, products });
+  const assets = statement.assets.currentAssets;
+  const liabilities = statement.liabilities.currentLiabilities;
+  return (
+    <>
+      <div className="tab-toolbar"><DateInput value={asOf} onChange={(date) => setAsOf(date ? dateInputKey(date) : "")} style={{ height: "32px", borderRadius: "6px" }} /><button className="outline form-control push-right" onClick={() => window.print()}><Download size={16} />Export PDF</button></div>
+      {!statement.isBalanced ? <div className="warning-banner"><AlertTriangle size={16} />Balance Sheet does not balance — check entries</div> : <div className="demo-box">Balance Sheet is balanced</div>}
+      <div className="financial-grid">
+        <div className="card pnl-statement">
+          <h2>Assets</h2>
+          <StatementSection title="Current Assets" rows={[["Cash in Hand", assets.cash], ["Bank Balance", assets.bankBalance], ["UPI/Card Receipts", assets.upiBalance], ["Accounts Receivable", assets.accountsReceivable], ["Inventory (Stock)", assets.inventory], ["Total Current Assets", assets.totalCurrentAssets]]} />
+          <StatementSection title="Fixed Assets" rows={[["Total Fixed Assets", statement.assets.fixedAssets.totalFixedAssets]]} />
+          <div className="statement-total profit"><span>Total Assets</span><strong>{INR.format(statement.assets.totalAssets)}</strong></div>
+        </div>
+        <div className="card pnl-statement">
+          <h2>Liabilities</h2>
+          <StatementSection title="Current Liabilities" rows={[["Accounts Payable", liabilities.accountsPayable], ["GST Payable", liabilities.gstPayable], ["Total Liabilities", liabilities.totalCurrentLiabilities]]} />
+          <StatementSection title="Equity" rows={[["Opening Capital", statement.equity.openingCapital], ["Net Profit", statement.equity.netProfit], ["Less: Drawings", -statement.equity.drawings], ["Total Equity", statement.equity.totalEquity]]} />
+          <div className="statement-total profit"><span>Total Liabilities + Equity</span><strong>{INR.format(statement.totalLiabilitiesAndEquity)}</strong></div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function LedgerScreen() {
+  return (
+    <section className="page">
+      <PageHeader title="Ledger" subtitle="Complete transaction history by account" />
+      <LedgerPanel />
+    </section>
+  );
+}
+
+function LedgerPanel() {
+  const { ledgerEntries, suppliers, customers } = useApp();
+  const [accountType, setAccountType] = useState<AccountType | "all">("all");
+  const [partyId, setPartyId] = useState("all");
+  const [search, setSearch] = useState("");
+  const parties = [...suppliers.map((supplier) => ({ id: supplier.id, name: supplier.name })), ...customers.map((customer) => ({ id: customer.id, name: customer.name }))];
+  const rows = ledgerEntries.filter((entry) => (accountType === "all" || entry.accountType === accountType) && (partyId === "all" || entry.partyId === partyId) && (!search.trim() || entry.description.toLowerCase().includes(search.trim().toLowerCase()) || entry.referenceId.toLowerCase().includes(search.trim().toLowerCase())));
+  const grouped = rows.reduce<Record<string, LedgerEntry[]>>((acc, entry) => {
+    const key = `${entry.accountType}:${entry.accountName}`;
+    acc[key] = [...(acc[key] ?? []), entry];
+    return acc;
+  }, {});
+  return (
+    <>
+      <div className="ledger-filter-row"><select className="form-control" value={accountType} onChange={(event) => setAccountType(event.target.value as AccountType | "all")}><option value="all">All Account Types</option>{(["cash", "bank", "upi", "sales", "purchases", "expenses", "supplier", "customer", "gst_output", "gst_input", "capital", "drawings"] as AccountType[]).map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}</select><select className="form-control" value={partyId} onChange={(event) => setPartyId(event.target.value)}><option value="all">All Parties</option>{parties.map((party) => <option key={party.id} value={party.id}>{party.name}</option>)}</select><label className="icon-input"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ledger" /></label><button className="outline form-control export-right" onClick={() => downloadCSV("ledger.csv", rows.map((entry) => ({ Date: formatDate(entry.date), Description: entry.description, Reference: entry.referenceId, Debit: entry.debit, Credit: entry.credit, Balance: entry.balance }))) }><Download size={16} />Export CSV</button></div>
+      {Object.entries(grouped).length ? Object.entries(grouped).map(([key, entries]) => {
+        const [, name] = key.split(":");
+        const closing = entries.reduce((sum, entry) => sum + entry.debit - entry.credit, 0);
+        return <div className="card" key={key}><div className="section-head"><h2>{name}</h2><strong>{INR.format(closing)}</strong></div><DataTable headers={["Date", "Description", "Reference", "Debit", "Credit", "Balance"]}>{entries.map((entry) => <tr key={entry.id}><td>{formatDate(entry.date)}</td><td>{entry.description}</td><td>{entry.referenceId}</td><td>{entry.debit ? INR.format(entry.debit) : "-"}</td><td>{entry.credit ? INR.format(entry.credit) : "-"}</td><td><strong className={entry.balance >= 0 ? "green-text" : "red-text"}>{INR.format(entry.balance)}</strong></td></tr>)}</DataTable></div>;
+      }) : <div className="empty compact">No ledger entries found.</div>}
+    </>
   );
 }
 
@@ -2554,7 +3226,7 @@ function StaffModal({ staff, onClose, onSave }: { staff: Staff | null; onClose: 
       <div className="modal-head"><div><h2>{staff ? "Edit Staff Member" : "Add New Staff Member"}</h2><p>Create a new account for your staff member.</p></div><button onClick={onClose}><X size={20} /></button></div>
       <IconField label="Full Name" icon={<User size={17} />} value={name} onChange={setName} placeholder="e.g. John Doe" />
       <IconField label="Email Address" icon={<Mail size={17} />} value={email} onChange={setEmail} placeholder="e.g. john@retailflow.com" />
-      <label className="field"><span>Role</span><div className="select-wrap"><select value={role} onChange={(e) => setRole(e.target.value === "Cashier (POS Only)" ? "Cashier" : e.target.value as StaffRole)}><option>Cashier (POS Only)</option><option>Salesperson</option><option>Manager</option><option>Owner</option></select></div></label>
+      <label className="field"><span>Role</span><div className="select-wrap"><select value={role} onChange={(e) => setRole(e.target.value === "Cashier (POS Only)" ? "Cashier" : e.target.value as StaffRole)}><option>Cashier (POS Only)</option><option>Staff</option><option>Manager</option><option>Owner</option></select></div></label>
       <IconField label="Password" icon={<Lock size={17} />} value={password} onChange={setPassword} placeholder={staff ? "Leave blank to keep current" : "Min. 8 characters"} type="password" />
       <div className="modal-actions end"><button className="primary" disabled={!valid} onClick={() => valid && onSave({ id: staff?.id ?? crypto.randomUUID(), name, email, role, isCurrent: staff?.isCurrent })}>{staff ? "Update Account" : "Create Account"}</button></div>
     </Modal>
@@ -2562,6 +3234,9 @@ function StaffModal({ staff, onClose, onSave }: { staff: Staff | null; onClose: 
 }
 
 function TextField({ label, value, onChange, placeholder, type = "text" }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; type?: string }) {
+  if (type === "date") {
+    return <label className="field"><span>{label}</span><DateInput value={value} onChange={(date) => onChange(date ? dateInputKey(date) : "")} placeholder={placeholder} /></label>;
+  }
   return <label className="field"><span>{label}</span><input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} /></label>;
 }
 

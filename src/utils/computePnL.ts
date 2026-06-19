@@ -20,6 +20,7 @@ export interface PnLReport {
 
 type SaleLike = { date: string; total: number; gst?: number; gstAmount?: number; status: string };
 type PurchaseLike = { orderDate: string; grandTotal: number; totalGST: number; status: string };
+type PurchaseBillLike = { billDate: string; status: string; totalGST: number; items: Array<{ quantity: number; unitCost: number; updateStock: boolean }> };
 type ExpenseLike = { date: string; category: string; amount: number };
 type ProductLike = { stock: number; costPrice?: number; price: number };
 
@@ -28,6 +29,7 @@ export function computePnLFromData(args: {
   to: Date;
   sales: SaleLike[];
   purchases: PurchaseLike[];
+  purchaseBills?: PurchaseBillLike[];
   expenses: ExpenseLike[];
   products: ProductLike[];
 }): PnLReport {
@@ -38,11 +40,13 @@ export function computePnLFromData(args: {
   const completedSales = args.sales.filter((sale) => inRange(sale.date) && sale.status.toLowerCase() === "completed");
   const refundedSales = args.sales.filter((sale) => inRange(sale.date) && sale.status.toLowerCase() === "refunded");
   const receivedPurchases = args.purchases.filter((po) => inRange(po.orderDate) && ["received", "partial"].includes(po.status));
+  const postedPurchaseBills = (args.purchaseBills ?? []).filter((bill) => inRange(bill.billDate) && bill.status !== "draft");
   const periodExpenses = args.expenses.filter((expense) => inRange(expense.date));
   const grossRevenue = completedSales.reduce((sum, sale) => sum + sale.total, 0);
   const returnsValue = refundedSales.reduce((sum, sale) => sum + sale.total, 0);
   const netRevenue = grossRevenue - returnsValue;
-  const purchasesValue = receivedPurchases.reduce((sum, po) => sum + po.grandTotal, 0);
+  const billPurchasesValue = postedPurchaseBills.reduce((sum, bill) => sum + bill.items.filter((item) => item.updateStock).reduce((itemSum, item) => itemSum + item.quantity * item.unitCost, 0), 0);
+  const purchasesValue = receivedPurchases.reduce((sum, po) => sum + po.grandTotal, 0) + billPurchasesValue;
   const closingStock = args.products.reduce((sum, product) => sum + product.stock * (product.costPrice ?? product.price * 0.65), 0);
   const cogs = Math.max(0, purchasesValue);
   const grossProfit = netRevenue - cogs;
@@ -53,7 +57,7 @@ export function computePnLFromData(args: {
   const totalExpenses = periodExpenses.reduce((sum, expense) => sum + expense.amount, 0);
   const netProfit = grossProfit - totalExpenses;
   const outputGST = completedSales.reduce((sum, sale) => sum + (sale.gstAmount ?? sale.gst ?? 0), 0);
-  const inputGST = receivedPurchases.reduce((sum, po) => sum + po.totalGST, 0);
+  const inputGST = receivedPurchases.reduce((sum, po) => sum + po.totalGST, 0) + postedPurchaseBills.reduce((sum, bill) => sum + bill.totalGST, 0);
 
   return {
     period: { from: args.from.toISOString(), to: args.to.toISOString() },
