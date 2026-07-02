@@ -1,0 +1,313 @@
+RETAILFLOW — BILLING MODE LAYOUT + SIDEBAR SCROLLBAR FIX
+
+Fix the Billing Mode layout and sidebar scrollbar behavior.
+Change ONLY the specified areas. Do NOT change business logic, calculations, scanner logic, table data, payment logic, or any other page.
+
+================================================================
+PART 1 — BILLING MODE: FINAL LAYOUT STRUCTURE
+================================================================
+
+Target Billing Mode layout:
+
+┌──────────────────────────────────────────────────┐
+│ BillNo │ Date │ Time │ Counter │ Person │ Type   │ 52px
+├──────────────────────────────────────────────────┤
+│ Customer [▼] │ Phone │ GSTIN │ Loyalty pts       │ 48px
+├──────────────────────────────────────────────────┤
+│ [Scan input.................] • Ready  [Add]     │ 50px
+├───────────────────────────────┬──────────────────┤
+│ # ITEM  SIZE COLOR SKU QTY..  │ Bill Summary     │
+│                               │ Total Items   0  │
+│   No items in bill            │ Gross Amt  ₹0.00 │
+│                               │ Discount   ₹0.00 │
+│                               │ CGST       ₹0.00 │
+│                               │ SGST       ₹0.00 │
+│                               │ Total GST  ₹0.00 │
+│                               │ Bill Disc%  [0]  │
+│                               │ ┌──────────────┐ │
+│                               │ │Net Payable   │ │
+│                               │ │    ₹0.00     │ │
+│                               │ └──────────────┘ │
+│                               │ [Charge]         │
+└───────────────────────────────┴──────────────────┘
+
+Required order from top to bottom:
+1. Bill header row — fixed height 52px
+   Bill No, Date, Time, Counter, Salesperson, Bill Type
+
+2. Customer bar — fixed height 48px
+   Customer dropdown, Phone, GSTIN, Loyalty points
+
+3. Scanner row — fixed height 50px
+   SKU/barcode scan input, Scanner Ready indicator, Add button
+
+4. Main content area — fills remaining height
+   Left: billing item table/grid
+   Right: Bill Summary panel
+
+There must be NO F-key bar at the bottom.
+
+================================================================
+PART 2 — BILLING MODE: REMOVE F-KEY BUTTONS BAR COMPLETELY
+================================================================
+
+Find and DELETE the entire F-key buttons section.
+
+It may look like:
+
+  <div className="billing-fkey-bar">
+    <button>F1 Item</button>
+    <button>F2 Delete</button>
+    <button>F3 Qty</button>
+    <button>F4 Disc</button>
+    <button>F5 New</button>
+    <button>F6 Bill Disc</button>
+    <button>F9 Customer</button>
+    <button>F10 Pay Mode</button>
+    <button>F12 Cash</button>
+    <button>Esc Exit</button>
+  </div>
+
+DELETE:
+- The entire fkey bar div and all children
+- Any CSS for .billing-fkey-bar
+- Any keyboard useEffect handling F1-F12 keys that only served these buttons
+- Any state related only to fkey bar visibility
+
+KEEP:
+- Scanner barcode keypress listener
+- Bill header row
+- SKU/search barcode row
+- Customer bar
+- Bill Summary panel
+- Net Payable box
+- Charge/payment button
+- Items table
+
+================================================================
+PART 3 — BILLING MODE: BILL SUMMARY PANEL
+================================================================
+
+Bill Summary must always fit inside the visible panel.
+No payment/charge action should be cut off.
+
+Use tighter spacing:
+
+Summary rows:
+  padding: 4px 0
+  fontSize: 12px
+
+Bill Summary header:
+  padding: 8px 14px
+
+Net Payable box:
+  padding: 10px 14px
+  marginBottom: 8px
+
+Net Payable amount:
+  fontSize: 22px
+
+Charge button:
+  height: 38px
+  marginBottom: 0
+
+Panel gap:
+  gap: 0
+
+The Charge button must trigger the same payment/charge functionality already used before in Card View.
+Do NOT create a new payment flow.
+Do NOT change payment calculation logic.
+Reuse the existing payment/charge handler.
+
+================================================================
+PART 4 — BILLING MODE: CUSTOMER BAR
+================================================================
+
+Move the Customer bar above the scanner row.
+
+Customer bar container:
+  height: 48px
+  padding: 0 16px
+  display: grid
+  alignItems: center
+
+Each field inside:
+  height: 30px
+  fontSize: 12px
+
+Labels:
+  fontSize: 10px
+  fontWeight: 600
+  color: #9ca3af
+  textTransform: uppercase
+  letterSpacing: 0.04em
+
+================================================================
+PART 5 — BILLING MODE: SCANNER ROW
+================================================================
+
+Scanner row:
+  height: 50px
+  display: flex
+  alignItems: center
+  gap: 8px
+
+Scanner input:
+  flex: 1
+  height: 36px
+
+Scanner Ready indicator:
+  flexShrink: 0
+
+Add button:
+  height: 36px
+  minWidth: 80px
+  flexShrink: 0
+
+Do NOT change scanner logic.
+
+================================================================
+PART 6 — BILLING MODE: TABLE EMPTY STATE
+================================================================
+
+Replace the empty table state with:
+
+<div style={{
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'center',
+  height: '100%',
+  minHeight: '220px',
+  gap: '12px',
+  color: '#9ca3af'
+}}>
+  <svg width="48" height="48" viewBox="0 0 24 24"
+    fill="none" stroke="#d1d5db" strokeWidth="1.5"
+    strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="9" cy="21" r="1" />
+    <circle cx="20" cy="21" r="1" />
+    <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+  </svg>
+
+  <div style={{ textAlign: 'center' }}>
+    <p style={{
+      fontSize: '14px',
+      fontWeight: 500,
+      color: '#374151',
+      margin: '0 0 4px'
+    }}>
+      No items in bill
+    </p>
+    <p style={{
+      fontSize: '12px',
+      color: '#9ca3af',
+      margin: 0
+    }}>
+      Scan barcode or search product above
+    </p>
+  </div>
+</div>
+
+================================================================
+PART 7 — SIDEBAR: REMOVE ALL SCROLLBARS
+================================================================
+
+Sidebar outermost wrapper:
+  className includes sidebar-wrapper
+  overflow: hidden
+  height: 100vh
+  display: flex
+  flexDirection: column
+  position: relative
+
+Sidebar nav container:
+  className includes sidebar-nav
+  overflow: hidden
+  flex: 1
+
+Sidebar user footer:
+  flexShrink: 0
+  position: relative
+
+Collapsed nav items:
+  overflow: hidden
+  width: 52px
+  display: flex
+  alignItems: center
+  justifyContent: center
+
+Collapsed nav labels:
+  display: none
+
+Collapsed section labels:
+  display: none
+
+Delete any sidebar scroll arrow buttons if present:
+  scrollLeft
+  scrollRight
+  arrow button containers
+  scroll position state related only to arrows
+
+Add CSS:
+
+.sidebar-wrapper,
+.sidebar-wrapper * {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.sidebar-wrapper::-webkit-scrollbar,
+.sidebar-wrapper *::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+.sidebar-nav {
+  overflow: hidden !important;
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+================================================================
+DO NOT CHANGE
+================================================================
+
+Do NOT change:
+- Scanner barcode listener
+- Bill header fields or logic
+- SKU search bar logic
+- Items table columns or calculations
+- Bill Summary calculations
+- Net Payable calculation
+- Existing payment/charge functionality
+- Customer data logic
+- Sidebar expanded/collapsed state logic
+- Sidebar active/inactive colors
+- Sidebar nav item routing
+- Any other page or component
+
+================================================================
+FILES TO MODIFY
+================================================================
+
+Use the actual project file structure:
+
+- src/App.tsx
+  - BillingMode/POS grid markup
+  - Sidebar markup
+
+- src/styles.css
+  - BillingMode layout styles
+  - Sidebar scrollbar hiding styles
+
+================================================================
+END
+================================================================

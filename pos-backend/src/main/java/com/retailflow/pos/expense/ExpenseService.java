@@ -1,0 +1,3 @@
+package com.retailflow.pos.expense;
+import jakarta.persistence.EntityNotFoundException;import java.time.LocalDate;import java.util.*;import org.springframework.stereotype.Service;
+@Service public class ExpenseService{private final ExpenseRepository r;public ExpenseService(ExpenseRepository r){this.r=r;}public List<Expense>list(LocalDate f,LocalDate t){return f!=null&&t!=null?r.findByExpenseDateBetween(f,t):r.findAll();}public Expense get(String id){return r.findById(id).orElseThrow(()->new EntityNotFoundException("Expense not found"));}public Expense save(Expense e){return r.save(e);}public void delete(String id){r.delete(get(id));}}

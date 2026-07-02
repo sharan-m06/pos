@@ -14,17 +14,20 @@
     "@expo/vector-icons": "^15.0.2",
     "@zxing/browser": "^0.2.0",
     "@zxing/library": "^0.22.0",
+    "dexie": "^4.4.4",
     "expo": "~54.0.25",
-    "flatpickr": "^4.6.13",
+    "expo-sqlite": "~16.0.10",
     "jsbarcode": "^3.12.3",
     "lucide-react": "^0.468.0",
+    "qrcode": "^1.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
     "react-native-web": "^0.21.0",
     "react-router-dom": "^6.30.2",
     "recharts": "^3.3.0",
-    "tailwindcss": "^4.1.17"
+    "tailwindcss": "^4.1.17",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/jsbarcode": "^3.11.4",

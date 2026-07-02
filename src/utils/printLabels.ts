@@ -42,7 +42,7 @@ export function printLabels(configs: LabelConfig[]) {
     for (let index = 0; index < copies; index += 1) {
       labels.push(`
         <div class="label" style="width:${dim.width}; height:${dim.height}; border:0.5px solid #ccc; padding:2mm; box-sizing:border-box; display:flex; flex-direction:column; align-items:center; justify-content:space-between; overflow:hidden; page-break-inside:avoid;">
-          <div style="font-size:${dim.fontSize}pt; font-weight:700; text-align:center; width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeLabel(product.name)}</div>
+          <div style="font-size:${dim.fontSize}pt; font-weight:600; text-align:center; width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeLabel(product.name)}</div>
           <div style="width:100%; display:flex; justify-content:center;">${svgContent}</div>
           <div style="font-size:${Math.max(5, dim.fontSize - 1)}pt; color:#555; text-align:center;">SKU: ${escapeLabel(product.sku)} | Rs.${product.price.toFixed(2)}</div>
         </div>
@@ -58,7 +58,7 @@ export function printLabels(configs: LabelConfig[]) {
         <title>Barcode Labels - RetailFlow</title>
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { background: white; font-family: Arial, sans-serif; }
+          body { background: white; font-family: "Google Sans", "DM Sans", "Noto Sans", sans-serif; }
           .page { width: 210mm; min-height: 297mm; padding: 5mm; display: flex; flex-wrap: wrap; gap: 1mm; align-content: flex-start; }
           svg { max-width: 100%; height: auto; }
           @media print {

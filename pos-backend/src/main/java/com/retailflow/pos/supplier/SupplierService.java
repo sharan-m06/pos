@@ -1,0 +1,3 @@
+package com.retailflow.pos.supplier;
+import jakarta.persistence.EntityNotFoundException;import java.util.*;import org.springframework.stereotype.Service;
+@Service public class SupplierService{private final SupplierRepository repo;public SupplierService(SupplierRepository repo){this.repo=repo;}public List<Supplier> list(Boolean active){return active==null?repo.findAll():repo.findByActive(active);}public Supplier get(String id){return repo.findById(id).orElseThrow(()->new EntityNotFoundException("Supplier not found"));}public Supplier save(Supplier value){return repo.save(value);}public void delete(String id){repo.delete(get(id));}}

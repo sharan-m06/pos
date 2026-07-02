@@ -32,14 +32,17 @@ import {
   Plus,
   ScanBarcode,
   Search,
+  Settings,
   ShoppingBag,
   ShoppingCart,
   Store,
   Trash2,
   TrendingUp,
   Truck,
+  Upload,
   User,
   Users,
+  WifiOff,
   X,
 } from "lucide-react";
 import { BrowserMultiFormatReader } from "@zxing/browser/cjs";
@@ -53,12 +56,21 @@ import {
   YAxis,
 } from "recharts";
 import "./styles.css";
-import DateInput from "./components/DateInput";
+import DatePicker from "./components/DatePicker";
+import TimePicker from "./components/TimePicker";
+import CompactStatCard from "./components/CompactStatCard";
 import { generateBarcodeSVG } from "./utils/barcodeGenerator";
 import { getScannerMethod, isMobileBrowser } from "./utils/barcodeScanner";
 import { formatDate, formatDateTime } from "./utils/dateUtils";
 import { generateUniqueBarcode, generateUniqueSKU, isBarcodeUnique, isSKUUnique, isValidEAN13, migrateProductCodes } from "./utils/generateProductCodes";
 import { LabelSize, printLabels } from "./utils/printLabels";
+import { applyExcelRowsToProducts, makeExcelTemplate, parseExcelBill, type ParsedExcelProductRow } from "./utils/parseExcelBill";
+import { generateSerialBarcodes } from "./utils/generateSerialBarcodes";
+import { productSerialService } from "./services/productSerialService";
+import { defaultPaymentSettings, generateUPIQR, type PaymentSettings } from "./utils/generateUPIQR";
+import { discountAmount, formatDiscountLabel, type DiscountInput } from "./utils/calculateDiscount";
+import { downloadBackupFile } from "./utils/backupService";
+import { useOnlineStatus } from "./utils/offlineSync";
 import type { Supplier } from "./types/supplier";
 import type { POItem, POStatus, PurchaseOrder } from "./types/purchaseOrder";
 import type { ExpenseCategory, PaymentMode } from "./types/expense";
@@ -68,7 +80,7 @@ import type { AccountType, LedgerEntry } from "./types/ledgerEntry";
 import { computePnLFromData } from "./utils/computePnL";
 import { computeBalanceSheetFromData } from "./utils/computeBalanceSheet";
 import { createBillLedgerEntries, createBillPaymentLedgerEntries, createExpenseLedgerEntry, createSaleLedgerEntries } from "./utils/createLedgerEntries";
-import { applyPurchaseBillStock } from "./services/purchaseBillService";
+import { applyPurchaseBillStock, reversePurchaseBillStock } from "./services/purchaseBillService";
 
 type UnitType = "piece" | "kg" | "meter" | "liter";
 type StaffRole = "Owner" | "Manager" | "Cashier" | "Staff";
@@ -109,11 +121,71 @@ type ToastState = {
   };
 };
 
+type BusinessInfo = {
+  businessName: string;
+  addressLine1: string;
+  addressLine2: string;
+  city: string;
+  state: string;
+  pinCode: string;
+  phone: string;
+  email: string;
+  gstin: string;
+  pan: string;
+  fssai?: string;
+  logoDataUrl?: string;
+  posMode?: "card" | "grid";
+  storeType?: "general" | "apparel" | "grocery" | "electronics" | "wholesale";
+};
+
+const defaultBusinessInfo: BusinessInfo = {
+  businessName: "Retail Demo Store",
+  addressLine1: "",
+  addressLine2: "",
+  city: "",
+  state: "",
+  pinCode: "",
+  phone: "",
+  email: "",
+  gstin: "",
+  pan: "",
+  fssai: "",
+  posMode: "card",
+  storeType: "general",
+};
+
+const storeTypeLabels: Record<NonNullable<BusinessInfo["storeType"]>, string> = {
+  general: "General Retail",
+  apparel: "Apparel / Textile",
+  grocery: "Grocery",
+  electronics: "Electronics",
+  wholesale: "Wholesale",
+};
+
+const BUSINESS_TYPE_CONFIG = {
+  retail_store: { defaultMode: "billing", label: "Retail Store" },
+  supermarket: { defaultMode: "billing", label: "Supermarket" },
+  grocery: { defaultMode: "billing", label: "Grocery Store" },
+  pharmacy: { defaultMode: "billing", label: "Pharmacy" },
+  electronics: { defaultMode: "billing", label: "Electronics Store" },
+  clothing: { defaultMode: "billing", label: "Clothing Store" },
+  restaurant: { defaultMode: "normal", label: "Restaurant" },
+  cafe: { defaultMode: "normal", label: "Cafe" },
+  salon: { defaultMode: "normal", label: "Salon" },
+  service: { defaultMode: "normal", label: "Service Business" },
+  wholesale: { defaultMode: "billing", label: "Wholesale" },
+  hardware: { defaultMode: "billing", label: "Hardware Store" },
+  default: { defaultMode: "normal", label: "General" },
+} as const;
+
+type BusinessTypeKey = keyof typeof BUSINESS_TYPE_CONFIG;
+
 type StandardLine = {
   id: string;
   type: "standard";
   product: Product;
   qty: number;
+  discount?: DiscountInput;
 };
 
 type FabricLine = {
@@ -124,10 +196,42 @@ type FabricLine = {
   lengthPerPiece: number;
   unit: "m" | "yd";
   totalMeters: number;
+  discount?: DiscountInput;
 };
 
 type OrderLine = StandardLine | FabricLine;
 type EditableOrderLine = OrderLine & { rowState?: "new" | "returned" };
+
+type BillingItem = {
+  id: string;
+  productId: string;
+  sku: string;
+  name: string;
+  qty: number;
+  rate: number;
+  discount: number;
+  gst: number;
+  value: number;
+  gstAmt: number;
+  cgst: number;
+  sgst: number;
+  total: number;
+};
+
+type BillingSummary = {
+  totalQty: number;
+  gross: number;
+  discount: number;
+  gst: number;
+  cgst: number;
+  sgst: number;
+  total: number;
+  grossAmount: string;
+  billDiscount: string;
+  totalDiscount: string;
+  totalGst: string;
+  netPayable: string;
+};
 
 type Invoice = {
   id: string;
@@ -144,6 +248,12 @@ type Invoice = {
   salespersonName: string;
   lines?: OrderLine[];
   discount?: number;
+  discountMode?: DiscountInput["mode"];
+  discountValue?: number;
+  discountBreakdown?: {
+    itemDiscount: number;
+    billDiscount: number;
+  };
 };
 
 type AttendanceRecord = {
@@ -332,6 +442,7 @@ function totalsForPurchaseBill(items: PurchaseBillItem[]) {
 }
 
 function purchaseBillDisplayStatus(bill: PurchaseBill) {
+  if (bill.status === "cancelled") return "cancelled";
   if (bill.balanceDue > 0 && bill.dueDate && new Date(bill.dueDate) < new Date()) return "overdue";
   if (bill.status === "paid") return "paid";
   if (bill.status === "partial_paid") return "partial";
@@ -414,6 +525,10 @@ type AppState = {
   setAttendance: React.Dispatch<React.SetStateAction<AttendanceRecord[]>>;
   order: OrderLine[];
   setOrder: React.Dispatch<React.SetStateAction<OrderLine[]>>;
+  paymentSettings: PaymentSettings;
+  setPaymentSettings: React.Dispatch<React.SetStateAction<PaymentSettings>>;
+  businessInfo: BusinessInfo;
+  setBusinessInfo: React.Dispatch<React.SetStateAction<BusinessInfo>>;
   toast: ToastState | null;
   showToast: (message: string, action?: ToastState["action"]) => void;
 };
@@ -426,9 +541,11 @@ const useApp = () => {
 };
 
 function amountForLine(line: OrderLine) {
-  const base = line.type === "standard" ? line.product.price * line.qty : line.product.price * line.totalMeters;
+  const grossBase = line.type === "standard" ? line.product.price * line.qty : line.product.price * line.totalMeters;
+  const itemDiscount = discountAmount(grossBase, line.discount);
+  const base = Math.max(0, grossBase - itemDiscount);
   const gst = base * (line.product.gstRate / 100);
-  return { base, gst, total: base + gst };
+  return { base, gst, total: base + gst, itemDiscount, grossBase };
 }
 
 function amountForProduct(product: Product) {
@@ -444,6 +561,29 @@ function receiptMoney(value: number) {
   return `Rs ${value.toFixed(2)}`;
 }
 
+function numberToIndianWords(value: number) {
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const underHundred = (n: number) => n < 20 ? ones[n] : `${tens[Math.floor(n / 10)]}${n % 10 ? ` ${ones[n % 10]}` : ""}`;
+  const underThousand = (n: number) => {
+    const hundred = Math.floor(n / 100);
+    const rest = n % 100;
+    return `${hundred ? `${ones[hundred]} Hundred` : ""}${hundred && rest ? " " : ""}${rest ? underHundred(rest) : ""}`.trim();
+  };
+  const whole = Math.floor(Math.max(0, value));
+  if (!whole) return "Rupees Zero Only";
+  const crore = Math.floor(whole / 10000000);
+  const lakh = Math.floor((whole % 10000000) / 100000);
+  const thousand = Math.floor((whole % 100000) / 1000);
+  const rest = whole % 1000;
+  return `Rupees ${[
+    crore ? `${underThousand(crore)} Crore` : "",
+    lakh ? `${underThousand(lakh)} Lakh` : "",
+    thousand ? `${underThousand(thousand)} Thousand` : "",
+    rest ? underThousand(rest) : "",
+  ].filter(Boolean).join(" ")} Only`;
+}
+
 function downloadCSV(filename: string, rows: Array<Record<string, string | number>>) {
   const headers = Object.keys(rows[0] ?? { Date: "", Description: "", Reference: "", Debit: "", Credit: "", Balance: "" });
   const csv = [headers.join(","), ...rows.map((row) => headers.map((header) => `"${String(row[header] ?? "").replace(/"/g, '""')}"`).join(","))].join("\n");
@@ -455,9 +595,10 @@ function downloadCSV(filename: string, rows: Array<Record<string, string | numbe
   URL.revokeObjectURL(url);
 }
 
-function buildThermalReceipt(invoice: Invoice) {
+function buildThermalReceipt(invoice: Invoice, business = defaultBusinessInfo) {
   const lines = invoice.lines ?? [];
   const subtotal = lines.reduce((sum, line) => sum + amountForLine(line).base, 0);
+  const itemDiscount = invoice.discountBreakdown?.itemDiscount ?? lines.reduce((sum, line) => sum + amountForLine(line).itemDiscount, 0);
   const itemRows = lines.flatMap((line) => {
     const amount = amountForLine(line);
     const qty = line.type === "fabric" ? `${line.pieces} pcs x ${line.lengthPerPiece}${line.unit}` : `${line.qty} ${unitLabel(line.product.unitType)}`;
@@ -469,7 +610,13 @@ function buildThermalReceipt(invoice: Invoice) {
   });
 
   return [
-    "        Retail Demo Store",
+    `        ${business.businessName || "Retail Demo Store"}`,
+    ...(business.addressLine1 ? [`${business.addressLine1}`] : []),
+    ...(business.addressLine2 ? [`${business.addressLine2}`] : []),
+    ...((business.city || business.state || business.pinCode) ? [`${[business.city, business.state].filter(Boolean).join(", ")}${business.pinCode ? ` - ${business.pinCode}` : ""}`] : []),
+    ...(business.phone || business.email ? [`Phone: ${business.phone || "-"} | Email: ${business.email || "-"}`] : []),
+    ...(business.gstin ? [`GSTIN: ${business.gstin}`] : []),
+    ...(business.pan ? [`PAN: ${business.pan}`] : []),
     "           Tax Invoice",
     "--------------------------------",
     `Invoice : ${invoice.id}`,
@@ -479,11 +626,15 @@ function buildThermalReceipt(invoice: Invoice) {
     "--------------------------------",
     ...itemRows,
     "--------------------------------",
-    `Subtotal      ${receiptMoney(subtotal)}`,
+    `Subtotal      ${receiptMoney(subtotal + itemDiscount)}`,
+    ...(itemDiscount ? [`Item Disc     -${receiptMoney(itemDiscount)}`] : []),
     `Total GST     ${receiptMoney(invoice.gst)}`,
-    ...(invoice.discount ? [`Discount      -${receiptMoney(invoice.discount)}`] : []),
+    ...(invoice.discount ? [`Bill Disc     -${receiptMoney(invoice.discount)}`] : []),
     `Total Payable ${receiptMoney(invoice.total)}`,
+    `In Words      ${numberToIndianWords(invoice.total)}`,
     "--------------------------------",
+    "Computer generated bill.",
+    "GST split as per supply rules.",
     "      Thank you. Visit again.",
     "",
     "",
@@ -491,10 +642,93 @@ function buildThermalReceipt(invoice: Invoice) {
 }
 
 async function printInvoice(invoice: Invoice) {
+  return printInvoiceWithSettings(invoice, defaultPaymentSettings, defaultBusinessInfo);
+}
+
+async function printInvoiceWithSettings(invoice: Invoice, settings: PaymentSettings, business: BusinessInfo) {
   const usb = (navigator as Navigator & { usb?: any }).usb;
   if (!usb) {
-    window.alert("Direct bill printing needs a WebUSB thermal printer. This browser cannot print directly without showing print preview.");
-    return false;
+    const win = window.open("", "_blank", "width=420,height=720");
+    if (!win) {
+      window.alert("Please allow pop-ups to print the bill.");
+      return false;
+    }
+    const qr = settings.printOnBill ? await generateUPIQR(settings, invoice.total, invoice.id) : "";
+    const lines = invoice.lines ?? [];
+    const lineRows = lines.map((line) => {
+      const amount = amountForLine(line);
+      const cgst = amount.gst / 2;
+      const sgst = amount.gst / 2;
+      return `<tr>
+        <td>${escapeHtml(line.product.name)}<br/><small>HSN/SAC: ${escapeHtml(line.product.description || "-")}</small></td>
+        <td>${escapeHtml(lineQuantityLabel(line))}</td>
+        <td>${escapeHtml(INR.format(amount.base))}</td>
+        <td>${escapeHtml(INR.format(cgst))}</td>
+        <td>${escapeHtml(INR.format(sgst))}</td>
+        <td>-</td>
+        <td>${escapeHtml(INR.format(amount.total))}</td>
+      </tr>`;
+    }).join("");
+    const businessAddress = [business.addressLine1, business.addressLine2].filter(Boolean).join(", ");
+    const cityLine = [business.city, business.state].filter(Boolean).join(", ");
+    win.document.write(`
+      <!doctype html>
+      <html>
+        <head>
+          <title>${escapeHtml(invoice.id)}</title>
+          <style>
+            body { font-family: "Google Sans", "DM Sans", "Noto Sans", sans-serif; color: #111827; padding: 24px; }
+            h1 { font-size: 18px; margin: 0 0 4px; text-align: center; }
+            .muted { color: #6b7280; font-size: 12px; text-align: center; margin-bottom: 16px; }
+            .row { display: flex; justify-content: space-between; gap: 16px; border-bottom: 1px dashed #d1d5db; padding: 8px 0; font-size: 13px; }
+            .total { font-size: 16px; font-weight: 600; border-bottom: 0; }
+            .qr { margin: 18px auto 6px; display: block; width: 160px; height: 160px; }
+            .center { text-align: center; font-size: 12px; color: #374151; }
+            .print-only { display: none; }
+            table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 12px; }
+            th, td { border: 1px solid #e5e7eb; padding: 7px; text-align: left; vertical-align: top; }
+            th { background: #f8fafc; font-weight: 600; }
+            .business-print-header { border: 1px solid #111827; padding: 12px; margin-bottom: 14px; text-align: center; }
+            .business-print-header img { max-width: 54px; max-height: 54px; object-fit: contain; margin-bottom: 6px; }
+            .business-print-header strong { display: block; font-size: 18px; }
+            .print-footer { margin-top: 18px; color: #475569; font-size: 11px; text-align: center; }
+            @media print { .print-only { display: block; } }
+          </style>
+        </head>
+        <body>
+          <div class="business-print-header print-only">
+            ${business.logoDataUrl ? `<img src="${business.logoDataUrl}" alt="Business Logo" />` : ""}
+            <strong>${escapeHtml(business.businessName || "Retail Demo Store")}</strong>
+            ${businessAddress ? `<div>${escapeHtml(businessAddress)}</div>` : ""}
+            ${cityLine || business.pinCode ? `<div>${escapeHtml(cityLine)}${business.pinCode ? ` - ${escapeHtml(business.pinCode)}` : ""}</div>` : ""}
+            ${business.phone || business.email ? `<div>Phone: ${escapeHtml(business.phone || "-")} | Email: ${escapeHtml(business.email || "-")}</div>` : ""}
+            ${business.gstin ? `<div>GSTIN: ${escapeHtml(business.gstin)}</div>` : ""}
+            ${business.pan ? `<div>PAN: ${escapeHtml(business.pan)}</div>` : ""}
+            ${business.fssai ? `<div>FSSAI: ${escapeHtml(business.fssai)}</div>` : ""}
+          </div>
+          <h1>${escapeHtml(business.businessName || "Retail Demo Store")}</h1>
+          <div class="muted">Tax Invoice · ${escapeHtml(invoice.id)}</div>
+          <div class="row"><span>Date</span><strong>${escapeHtml(formatDateTime(invoice.date))}</strong></div>
+          <div class="row"><span>Customer</span><strong>${escapeHtml(invoice.customer)}</strong></div>
+          <div class="row"><span>Place of Supply</span><strong>${escapeHtml(business.state || "-")}</strong></div>
+          <div class="row"><span>Supply Type</span><strong>Intra-state</strong></div>
+          <div class="row"><span>Payment</span><strong>${escapeHtml(invoice.payment)}</strong></div>
+          <div class="row"><span>Items</span><strong>${escapeHtml(invoice.items)}</strong></div>
+          ${lineRows ? `<table class="print-only"><thead><tr><th>Item</th><th>Qty</th><th>Taxable Value</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Total</th></tr></thead><tbody>${lineRows}</tbody></table>` : ""}
+          <div class="row"><span>Total GST</span><strong>${escapeHtml(INR.format(invoice.gst))}</strong></div>
+          ${invoice.discount ? `<div class="row"><span>Discount</span><strong>-${escapeHtml(INR.format(invoice.discount))}</strong></div>` : ""}
+          <div class="row total"><span>Total Payable</span><strong>${escapeHtml(INR.format(invoice.total))}</strong></div>
+          <div class="row print-only"><span>Total Tax Amount</span><strong>${escapeHtml(INR.format(invoice.gst))}</strong></div>
+          <div class="row print-only"><span>Invoice Value in Words</span><strong>${escapeHtml(numberToIndianWords(invoice.total))}</strong></div>
+          ${qr ? `<img class="qr" src="${qr}" alt="Payment QR" /><div class="center">Scan to pay via UPI</div>` : ""}
+          <div class="print-footer print-only">This is a computer generated bill.<br/>GST shown as CGST and SGST for intra-state supply; IGST applies only for inter-state supply as per Indian GST rules.</div>
+        </body>
+      </html>
+    `);
+    win.document.close();
+    win.focus();
+    win.print();
+    return true;
   }
 
   try {
@@ -517,7 +751,7 @@ async function printInvoice(invoice: Invoice) {
     const encoder = new TextEncoder();
     const init = [0x1b, 0x40];
     const cut = [0x1d, 0x56, 0x00];
-    const receipt = encoder.encode(buildThermalReceipt(invoice));
+    const receipt = encoder.encode(buildThermalReceipt(invoice, business));
     const payload = new Uint8Array(init.length + receipt.length + cut.length);
     payload.set(init, 0);
     payload.set(receipt, init.length);
@@ -676,13 +910,13 @@ function salesPdfHtml(invoices: Invoice[], products: Product[]) {
       <head>
         <title>Sales History Export</title>
         <style>
-          body { font-family: Arial, sans-serif; color: #0f172a; padding: 28px; }
+          body { font-family: "Google Sans", "DM Sans", "Noto Sans", sans-serif; color: #0f172a; padding: 28px; }
           h1 { margin: 0 0 4px; font-size: 24px; }
           p { margin: 0 0 20px; color: #475569; }
           table { width: 100%; border-collapse: collapse; font-size: 12px; }
           th, td { border: 1px solid #e2e8f0; padding: 8px; text-align: left; }
           th { background: #f8fafc; }
-          .num { text-align: right; font-weight: 700; }
+          .num { text-align: right; font-weight: 600; }
         </style>
       </head>
       <body>
@@ -807,6 +1041,7 @@ function roleAccess(role: StaffRole) {
     canViewReports: isOwner,
     canViewPerformance: isOwner,
     canManageStaff: isOwner,
+    canManageSettings: isOwner,
     salesScope: isCashier ? "own" : "all",
   };
 }
@@ -829,15 +1064,42 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   const [staff, setStaff] = useState(() => savedSessionEmail ? seedStaff.map((member) => ({ ...member, isCurrent: member.email.toLowerCase() === savedSessionEmail })) : seedStaff);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [order, setOrder] = useState<OrderLine[]>([]);
+  const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(() => {
+    if (typeof localStorage === "undefined") return defaultPaymentSettings;
+    try {
+      return { ...defaultPaymentSettings, ...JSON.parse(localStorage.getItem("retailflow-payment-settings") || "{}") };
+    } catch {
+      return defaultPaymentSettings;
+    }
+  });
+  const [businessInfo, setBusinessInfo] = useState<BusinessInfo>(() => {
+    if (typeof localStorage === "undefined") return defaultBusinessInfo;
+    try {
+      return { ...defaultBusinessInfo, ...JSON.parse(localStorage.getItem("retailflow-business-info") || "{}") };
+    } catch {
+      return defaultBusinessInfo;
+    }
+  });
   const [toast, setToast] = useState<ToastState | null>(null);
   const showToast = (message: string, action?: ToastState["action"]) => {
     setToast({ message, action });
     window.setTimeout(() => setToast(null), action ? 4200 : 2600);
   };
 
+  useEffect(() => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("retailflow-payment-settings", JSON.stringify(paymentSettings));
+    }
+  }, [paymentSettings]);
+  useEffect(() => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("retailflow-business-info", JSON.stringify(businessInfo));
+    }
+  }, [businessInfo]);
+
   const value = useMemo(
-    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, purchaseBills, setPurchaseBills, stockMovements, setStockMovements, ledgerEntries, setLedgerEntries, customers, setCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, toast, showToast }),
-    [products, invoices, expenses, suppliers, purchaseOrders, purchaseBills, stockMovements, ledgerEntries, customers, staff, attendance, order, toast],
+    () => ({ products, setProducts, invoices, setInvoices, expenses, setExpenses, suppliers, setSuppliers, purchaseOrders, setPurchaseOrders, purchaseBills, setPurchaseBills, stockMovements, setStockMovements, ledgerEntries, setLedgerEntries, customers, setCustomers, staff, setStaff, attendance, setAttendance, order, setOrder, paymentSettings, setPaymentSettings, businessInfo, setBusinessInfo, toast, showToast }),
+    [products, invoices, expenses, suppliers, purchaseOrders, purchaseBills, stockMovements, ledgerEntries, customers, staff, attendance, order, paymentSettings, businessInfo, toast],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -994,6 +1256,7 @@ function useHashTab<T extends string>(allowed: readonly T[], fallback: T) {
 
 function Shell({ onSignOut }: { onSignOut: () => void }) {
   const { toast, staff } = useApp();
+  const online = useOnlineStatus();
   const location = useLocation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => (typeof localStorage !== "undefined" ? localStorage.getItem("sidebarCollapsed") === "true" : false));
   const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
@@ -1004,7 +1267,6 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
     { path: "/pos", label: "Point of Sale", icon: <ShoppingCart size={17} />, allowed: access.canUsePos },
     { path: "/sales", label: "Sales History", icon: <IndianRupee size={17} />, allowed: access.canViewSales },
     { path: "/products", label: "Inventory", icon: <Box size={17} />, allowed: access.canManageInventory },
-    { type: "section", label: "Procurement", allowed: access.canManageProcurement },
     { path: "/procurement#suppliers", label: "Procurement", icon: <Truck size={17} />, allowed: access.canManageProcurement },
     { path: "/customers", label: "Customers", icon: <Users size={17} />, allowed: access.canManageCustomers },
     { type: "section", label: "Finance", allowed: access.canViewReports || access.canViewExpenses || access.canViewPnL },
@@ -1013,24 +1275,25 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
     { path: "/financials#balance-sheet", label: "Financials", icon: <TrendingUp size={17} />, allowed: access.canViewPnL || access.canViewBalanceSheet || access.canViewLedger },
     { path: "/performance", label: "Performance", icon: <BarChart3 size={17} />, allowed: access.canViewPerformance },
     { path: "/staff", label: "Staff", icon: <User size={17} />, allowed: access.canManageStaff },
+    { path: "/settings", label: "Settings", icon: <Settings size={17} />, allowed: access.canManageSettings },
   ];
 
   useEffect(() => {
-    const width = sidebarCollapsed ? "64px" : "268px";
+    const width = sidebarCollapsed ? "64px" : "208px";
     document.documentElement.style.setProperty("--sidebar-width", width);
     localStorage.setItem("sidebarCollapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <aside className="sidebar">
+      <aside className="sidebar sidebar-wrapper">
         <div className="store-head">
           <button className="store-brand-toggle" type="button" title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setSidebarCollapsed((value) => !value)}>
             <div className="brand-mark"><Store size={22} /></div>
             {!sidebarCollapsed ? <strong>Retail Demo Store</strong> : null}
           </button>
         </div>
-        <nav>
+        <nav className="sidebar-nav">
           {navItems.filter((item) => item.allowed).map((item) => (
             item.type === "section"
               ? <div className="nav-section-label" key={`section-${item.label}`}>{item.label}</div>
@@ -1039,7 +1302,7 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
         </nav>
         <div className="sidebar-user">
           <div className="avatar">{currentUser.name[0]}</div>
-          {!sidebarCollapsed ? <div><strong>{currentUser.name}</strong><span>{currentUser.role}</span></div> : null}
+          {!sidebarCollapsed ? <div className="sidebar-profile-copy"><strong>{currentUser.name}</strong><span>{currentUser.role}</span></div> : null}
         </div>
         <button
           className="signout"
@@ -1071,10 +1334,13 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
             <Route path="/reports/ledger" element={<Navigate to="/financials#ledger" replace />} />
             <Route path="/performance" element={access.canViewPerformance ? <Performance /> : <Navigate to={defaultRoute} replace />} />
             <Route path="/staff" element={access.canManageStaff ? <StaffPage /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/settings" element={access.canManageSettings ? <SettingsPage /> : <Navigate to={defaultRoute} replace />} />
+            <Route path="/settings/business" element={access.canManageSettings ? <SettingsPage /> : <Navigate to={defaultRoute} replace />} />
             <Route path="*" element={<Navigate to={defaultRoute} replace />} />
           </Routes>
         )}
       </main>
+      {!online ? <div className="offline-banner"><WifiOff size={15} />Offline mode active. Sales and edits will stay on this device until connection returns.</div> : null}
       {toast ? <div className="toast"><span>{toast.message}</span>{toast.action ? <button onClick={toast.action.onClick}>{toast.action.label}</button> : null}</div> : null}
     </div>
   );
@@ -1089,9 +1355,78 @@ function PageHeader({ title, subtitle, action }: { title: string; subtitle: stri
   );
 }
 
+function SettingsPage() {
+  const { paymentSettings, setPaymentSettings, businessInfo, setBusinessInfo, products, invoices, expenses, suppliers, purchaseOrders, purchaseBills, customers, stockMovements, ledgerEntries, showToast } = useApp();
+  const update = <K extends keyof PaymentSettings>(key: K, value: PaymentSettings[K]) => setPaymentSettings((settings) => ({ ...settings, [key]: value }));
+  const updateBusiness = <K extends keyof BusinessInfo>(key: K, value: BusinessInfo[K]) => setBusinessInfo((info) => ({ ...info, [key]: value }));
+  async function uploadLogo(file?: File) {
+    if (!file) return;
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+    updateBusiness("logoDataUrl", dataUrl);
+  }
+  return (
+    <section className="page">
+      <PageHeader title="Settings" subtitle="Payment QR, backup, and offline controls." />
+      <div className="settings-grid">
+        <div className="card settings-card settings-card-wide">
+          <h3>Business Info</h3>
+          <div className="form-grid two">
+            <label className="field"><span>Business Name</span><input value={businessInfo.businessName} onChange={(event) => updateBusiness("businessName", event.target.value)} /></label>
+            <label className="field"><span>Phone Number</span><input value={businessInfo.phone} onChange={(event) => updateBusiness("phone", event.target.value)} /></label>
+            <label className="field"><span>Email</span><input type="email" value={businessInfo.email} onChange={(event) => updateBusiness("email", event.target.value)} /></label>
+            <label className="field"><span>GSTIN</span><input value={businessInfo.gstin} onChange={(event) => updateBusiness("gstin", event.target.value.toUpperCase())} /></label>
+            <label className="field"><span>PAN Number</span><input value={businessInfo.pan} onChange={(event) => updateBusiness("pan", event.target.value.toUpperCase())} /></label>
+            <label className="field"><span>FSSAI License</span><input value={businessInfo.fssai ?? ""} onChange={(event) => updateBusiness("fssai", event.target.value)} /></label>
+          </div>
+          <div className="form-grid two">
+            <label className="field"><span>Address Line 1</span><input value={businessInfo.addressLine1} onChange={(event) => updateBusiness("addressLine1", event.target.value)} /></label>
+            <label className="field"><span>Address Line 2</span><input value={businessInfo.addressLine2} onChange={(event) => updateBusiness("addressLine2", event.target.value)} /></label>
+            <label className="field"><span>City</span><input value={businessInfo.city} onChange={(event) => updateBusiness("city", event.target.value)} /></label>
+            <label className="field"><span>State</span><input value={businessInfo.state} onChange={(event) => updateBusiness("state", event.target.value)} /></label>
+            <label className="field"><span>PIN Code</span><input value={businessInfo.pinCode} onChange={(event) => updateBusiness("pinCode", event.target.value)} /></label>
+            <label className="field"><span>Business Logo</span><label className="outline file-button settings-logo-upload">Upload Logo<input type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label></label>
+          </div>
+          {businessInfo.logoDataUrl ? <img className="business-logo-preview" src={businessInfo.logoDataUrl} alt="Business logo preview" /> : null}
+          <div className="modal-actions end"><button className="primary" onClick={() => showToast("Business info saved")}>Save</button></div>
+        </div>
+        <div className="card settings-card">
+          <h3>POS Settings</h3>
+          <div className="settings-option-group">
+            <span>POS Interface Mode</span>
+            <label className="settings-choice"><input type="radio" name="pos-mode" checked={(businessInfo.posMode ?? "card") === "card"} onChange={() => updateBusiness("posMode", "card")} /><strong>Card View</strong><small>Product grid with tiles</small></label>
+            <label className="settings-choice"><input type="radio" name="pos-mode" checked={(businessInfo.posMode ?? "card") === "grid"} onChange={() => updateBusiness("posMode", "grid")} /><strong>Grid View</strong><small>Spreadsheet-style billing table</small></label>
+          </div>
+          <label className="field"><span>Store Type</span><select value={businessInfo.storeType ?? "general"} onChange={(event) => updateBusiness("storeType", event.target.value as NonNullable<BusinessInfo["storeType"]>)}>{Object.entries(storeTypeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        </div>
+        <div className="card settings-card">
+          <h3>Payment QR on Bills</h3>
+          <label className="field"><span>UPI ID</span><input value={paymentSettings.upiId} onChange={(event) => update("upiId", event.target.value)} placeholder="store@upi" /></label>
+          <label className="field"><span>Merchant Name</span><input value={paymentSettings.merchantName} onChange={(event) => update("merchantName", event.target.value)} /></label>
+          <label className="field"><span>QR Type</span><select value={paymentSettings.qrMode} onChange={(event) => update("qrMode", event.target.value as PaymentSettings["qrMode"])}><option value="dynamic">Dynamic amount QR</option><option value="static">Static UPI QR</option></select></label>
+          <label className="toggle-line"><input type="checkbox" checked={paymentSettings.printOnBill} onChange={(event) => update("printOnBill", event.target.checked)} /><span>Print QR on bill preview</span></label>
+        </div>
+        <div className="card settings-card">
+          <h3>Auto Backup</h3>
+          <p className="muted">Create a local backup file that can be restored outside the app if needed.</p>
+          <button className="primary" onClick={() => {
+            downloadBackupFile({ products, invoices, expenses, suppliers, purchaseOrders, purchaseBills, customers, stockMovements, ledgerEntries });
+            showToast("Backup downloaded");
+          }}><Download size={16} />Download Backup</button>
+          <div className="demo-box">Google Drive backup requires OAuth credentials before it can sync to an external account.</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function Dashboard() {
   const kpis = [
-    ["Total Revenue", "₹499.93", "+20.1% from last month", <IndianRupee />],
+    ["Total Revenue", "₹499.93", "+20.1% from last month", <TrendingUp />],
     ["Sales", "+4", "+180.1% from last month", <ShoppingCart />],
     ["Products in Stock", "808", "Across 10 categories", <Box />],
     ["Low Stock Alert", "1", "Items need reordering", <AlertTriangle />],
@@ -1101,15 +1436,18 @@ function Dashboard() {
       <PageHeader title="Dashboard" subtitle="Overview of your store's performance." action={<div className="date">{longDate()}</div>} />
       <div className="kpi-grid">
         {kpis.map(([title, value, sub, icon], idx) => (
-          <div className="card kpi" key={title}>
-            <div><span>{title}</span><strong>{value}</strong><small className={idx < 2 ? "green-text" : ""}>{sub}</small></div>
-            <div className={`kpi-icon ${idx === 3 ? "warn" : ""}`}>{icon}</div>
-          </div>
+          <CompactStatCard
+            key={title}
+            icon={icon}
+            value={value}
+            label={title}
+            detail={<span className={idx < 2 ? "green-text" : ""}>{sub}</span>}
+          />
         ))}
       </div>
       <div className="dashboard-row">
         <div className="card chart-card"><h2>Weekly Revenue</h2><RevenueChart data={weeklyData} xKey="day" /></div>
-        <div className="card"><h2>Low Stock Items</h2><div className="low-row"><div><strong>Sunglasses</strong><span>SKU: SG-005</span></div><b>8 left</b></div></div>
+        <div className="card low-stock-card"><h2>Low Stock Items</h2><div className="low-row"><div><strong>Sunglasses</strong><span>SKU: SG-005</span><div className="stock-progress"><i style={{ width: "40%" }} /></div></div><b>8 left</b></div></div>
       </div>
     </section>
   );
@@ -1134,14 +1472,14 @@ function chartYAxis(value: number, isMobile: boolean) {
   return `₹${value.toLocaleString("en-IN")}`;
 }
 
-function RevenueChart({ data, xKey, height = 300 }: { data: Array<Record<string, string | number>>; xKey: string; height?: number }) {
+function RevenueChart({ data, xKey, height = 260 }: { data: Array<Record<string, string | number>>; xKey: string; height?: number }) {
   const isMobile = useIsMobileViewport();
   const chartHeight = isMobile ? 220 : height;
 
   return (
     <div className="chart-wrap" style={{ height: chartHeight, minHeight: chartHeight }}>
       <ResponsiveContainer width="100%" height={chartHeight}>
-        <BarChart data={data} barCategoryGap="8%" barGap={0} margin={{ top: 12, right: 12, left: isMobile ? -10 : 8, bottom: 0 }}>
+        <BarChart data={data} barCategoryGap="8%" barGap={0} margin={{ top: 6, right: 8, left: isMobile ? -10 : 4, bottom: 0 }}>
           <CartesianGrid vertical={false} stroke="#E5E7EB" />
           <XAxis dataKey={xKey} tickLine={false} axisLine={false} />
           <YAxis tickFormatter={(v) => chartYAxis(Number(v), isMobile)} domain={[0, "dataMax + 100"]} tickLine={false} axisLine={false} />
@@ -1159,8 +1497,14 @@ function GSTPill({ rate }: { rate: number }) {
 }
 
 function POS() {
-  const { products, setProducts, order, setOrder, setInvoices, setStockMovements, setLedgerEntries, customers, setCustomers, staff, showToast } = useApp();
+  const { products, setProducts, invoices, order, setOrder, setInvoices, setStockMovements, setLedgerEntries, customers, setCustomers, staff, paymentSettings, businessInfo, setBusinessInfo, showToast } = useApp();
   const location = useLocation();
+  const businessType = (typeof localStorage !== "undefined" ? localStorage.getItem("business_type") : null)
+    || (businessInfo as BusinessInfo & { businessType?: string }).businessType
+    || "default";
+  const businessTypeConfig = BUSINESS_TYPE_CONFIG[(businessType in BUSINESS_TYPE_CONFIG ? businessType : "default") as BusinessTypeKey];
+  const posInterfaceMode = businessInfo.posMode ?? "card";
+  const posStoreType = businessInfo.storeType ?? "general";
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [category, setCategory] = useState("All");
@@ -1169,6 +1513,23 @@ function POS() {
   const [orderWidth, setOrderWidth] = useState(390);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [isProductGridScrolled, setIsProductGridScrolled] = useState(false);
+  const [billingMode, setBillingMode] = useState(() => {
+    if (posInterfaceMode === "grid") return true;
+    return businessTypeConfig.defaultMode === "billing";
+  });
+  const [billingItems, setBillingItems] = useState<BillingItem[]>([]);
+  const [selectedRow, setSelectedRow] = useState<number | null>(null);
+  const [billNo, setBillNo] = useState(() => `BILL-${String(Date.now()).slice(-5)}`);
+  const [billDiscount, setBillDiscount] = useState(0);
+  const [billSummary, setBillSummary] = useState<BillingSummary>({ totalQty: 0, gross: 0, discount: 0, gst: 0, cgst: 0, sgst: 0, total: 0, grossAmount: "0.00", billDiscount: "0.00", totalDiscount: "0.00", totalGst: "0.00", netPayable: "0.00" });
+  const [previousBillNo, setPreviousBillNo] = useState("");
+  const [billingNow, setBillingNow] = useState(new Date());
+  const [billingSku, setBillingSku] = useState("");
+  const [highlightedRow, setHighlightedRow] = useState<number | null>(null);
+  const [quantityModalProduct, setQuantityModalProduct] = useState<Product | null>(null);
+  const [quantityPieces, setQuantityPieces] = useState(1);
+  const [quantityLength, setQuantityLength] = useState(1);
+  const [quantityUnit, setQuantityUnit] = useState("m");
   const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
   const salespersonOptions = [...staff].sort((a, b) => a.role === "Owner" ? -1 : b.role === "Owner" ? 1 : a.name.localeCompare(b.name));
   const [selectedSalespersonId, setSelectedSalespersonId] = useState(currentUser?.id ?? "");
@@ -1180,6 +1541,10 @@ function POS() {
   const [customerQuery, setCustomerQuery] = useState(initialCustomer?.name ?? "Walk-in");
   const [customerDropdownOpen, setCustomerDropdownOpen] = useState(false);
   const barcodeInputRef = useRef<HTMLInputElement | null>(null);
+  const skuInputRef = useRef<HTMLInputElement | null>(null);
+  const billDiscountRef = useRef<HTMLInputElement | null>(null);
+  const billingCustomerRef = useRef<HTMLInputElement | null>(null);
+  const tableRef = useRef<HTMLDivElement | null>(null);
   const prewarmedStreamRef = useRef<MediaStream | null>(null);
   const categories = ["All", "Apparel", "Footwear", "Accessories", "Groceries", "Electronics"];
   const filtered = products.filter((p) => (category === "All" || p.category === category) && `${p.name} ${p.sku} ${p.barcode ?? ""}`.toLowerCase().includes(search.toLowerCase()));
@@ -1189,11 +1554,13 @@ function POS() {
     : `Showing ${filtered.length} product${filtered.length === 1 ? "" : "s"}`;
   const totals = order.reduce((acc, line) => {
     const amount = amountForLine(line);
+    acc.grossBase += amount.grossBase;
+    acc.itemDiscount += amount.itemDiscount;
     acc.base += amount.base;
     acc.gst += amount.gst;
     acc.total += amount.total;
     return acc;
-  }, { base: 0, gst: 0, total: 0 });
+  }, { grossBase: 0, itemDiscount: 0, base: 0, gst: 0, total: 0 });
   const normalizeBarcode = (value: string) => value.trim().toLowerCase().replace(/[\s-]/g, "");
   const canCharge = order.length > 0 && selectedSalesperson !== null;
   const selectedCustomer = customers.find((customer) => customer.id === selectedCustomerId) ?? null;
@@ -1201,6 +1568,353 @@ function POS() {
   const customerMatches = customerSearch && customerSearch !== "walk-in"
     ? customers.filter((customer) => `${customer.name} ${customer.phone}`.toLowerCase().includes(customerSearch)).slice(0, 5)
     : customers.slice(0, 5);
+  const billingDate = formatDate(billingNow);
+  const billingTime = billingNow.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true });
+  const billingExtraColumnCount = posStoreType === "apparel" ? 2 : posStoreType === "electronics" ? 2 : posStoreType === "grocery" ? 1 : posStoreType === "wholesale" ? 1 : 0;
+
+  function calculateBillingItem(item: Omit<BillingItem, "value" | "gstAmt" | "cgst" | "sgst" | "total">): BillingItem {
+    const qty = Math.max(0, Number(item.qty) || 0);
+    const rate = Math.max(0, Number(item.rate) || 0);
+    const discount = Math.max(0, Number(item.discount) || 0);
+    const value = Math.max(0, qty * rate - discount);
+    const gstAmt = value * ((Number(item.gst) || 0) / 100);
+    const cgst = gstAmt / 2;
+    const sgst = gstAmt / 2;
+    return { ...item, qty, rate, discount, value, gstAmt, cgst, sgst, total: value + gstAmt };
+  }
+
+  function isQuantityModalUnit(product: Product) {
+    return ["meter", "m", "kg", "kilogram", "litre", "liter", "l", "gram", "g", "ml", "milliliter", "cm", "foot", "feet", "ft"].includes(String(product.unitType ?? "").toLowerCase());
+  }
+
+  function openBillingQuantityModal(product: Product) {
+    const unit = String(product.unitType || "m").toLowerCase();
+    setQuantityModalProduct(product);
+    setQuantityPieces(1);
+    setQuantityLength(1);
+    setQuantityUnit(unit === "meter" ? "m" : unit === "liter" ? "litre" : unit);
+    setBillingSku("");
+  }
+
+  function closeBillingQuantityModal() {
+    setQuantityModalProduct(null);
+    window.setTimeout(() => skuInputRef.current?.focus(), 0);
+  }
+
+  function productToBillingItem(product: Product, qty?: number): BillingItem {
+    return calculateBillingItem({
+      id: crypto.randomUUID(),
+      productId: product.id,
+      sku: product.sku,
+      name: product.name,
+      qty: qty ?? (product.unitType === "piece" ? 1 : 0.5),
+      rate: product.price,
+      discount: 0,
+      gst: product.gstRate,
+    });
+  }
+
+  function updateBillingItem(index: number, field: "qty" | "rate" | "discount" | "gst", value: number) {
+    setBillingItems((items) => items.map((item, itemIndex) => itemIndex === index ? calculateBillingItem({ ...item, [field]: value }) : item));
+  }
+
+  function flashHighlightedBillingRow(index: number) {
+    setHighlightedRow(index);
+    window.setTimeout(() => setHighlightedRow(null), 600);
+  }
+
+  function playBillingBeep() {
+    try {
+      const AudioContextClass = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const ctx = new AudioContextClass();
+      const oscillator = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      oscillator.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      oscillator.frequency.value = 880;
+      oscillator.type = "sine";
+      gainNode.gain.setValueAtTime(0.3, ctx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
+      oscillator.start(ctx.currentTime);
+      oscillator.stop(ctx.currentTime + 0.1);
+      window.setTimeout(() => ctx.close().catch(() => undefined), 160);
+    } catch {
+      // Audio feedback is optional; scanners should still work without it.
+    }
+  }
+
+  function flashSkuInput(type: "success" | "error", value = "") {
+    const input = skuInputRef.current;
+    if (!input) return;
+    setBillingSku(value);
+    input.value = value;
+    input.style.borderColor = type === "success" ? "#22C55E" : "#EF4444";
+    input.style.background = type === "success" ? "#F0FDF4" : "#FEF2F2";
+    window.setTimeout(() => {
+      if (!skuInputRef.current) return;
+      skuInputRef.current.style.borderColor = "#2563EB";
+      skuInputRef.current.style.background = "#FFFFFF";
+      skuInputRef.current.value = "";
+      setBillingSku("");
+    }, type === "success" ? 800 : 1500);
+  }
+
+  function addBillingProduct(product: Product, feedback = false, qty?: number) {
+    const quantityToAdd = Math.max(0, Number(qty ?? (product.unitType === "piece" ? 1 : 0.5)) || 0);
+    if (!quantityToAdd) return;
+    setBillingItems((items) => {
+      const existingIndex = items.findIndex((item) => item.productId === product.id);
+      if (existingIndex === -1 || isQuantityModalUnit(product)) {
+        const next = [...items, productToBillingItem(product, quantityToAdd)];
+        setSelectedRow(next.length - 1);
+        flashHighlightedBillingRow(next.length - 1);
+        window.setTimeout(() => {
+          if (tableRef.current) tableRef.current.scrollTop = tableRef.current.scrollHeight;
+        }, 50);
+        return next;
+      }
+      const next = items.map((item, index) => index === existingIndex ? calculateBillingItem({ ...item, qty: item.qty + quantityToAdd }) : item);
+      setSelectedRow(existingIndex);
+      flashHighlightedBillingRow(existingIndex);
+      return next;
+    });
+    setBillingSku("");
+    if (feedback) {
+      flashSkuInput("success", product.sku);
+      playBillingBeep();
+    }
+    showToast(`${product.name} added to billing`);
+  }
+
+  function findBillingProduct(value: string) {
+    const normalized = normalizeBarcode(value);
+    const searchValue = value.trim().toLowerCase();
+    if (!normalized && !searchValue) return null;
+    return products.find((product) =>
+      [product.sku, product.barcode].some((code) => code && normalizeBarcode(code) === normalized) ||
+      product.name.toLowerCase().includes(searchValue)
+    ) ?? null;
+  }
+
+  function handleBillingSkuSubmit(event?: React.FormEvent) {
+    event?.preventDefault();
+    processBillingBarcode(billingSku);
+    window.setTimeout(() => skuInputRef.current?.focus(), 0);
+  }
+
+  function processBillingBarcode(code: string) {
+    const value = code.trim();
+    if (!value) {
+      showToast("Enter SKU, PLU, barcode, or product name");
+      return;
+    }
+    const product = findBillingProduct(value);
+    if (!product) {
+      showToast(`Product not found: ${value}`);
+      setBillingSku("");
+      flashSkuInput("error", value);
+      return;
+    }
+    if (isQuantityModalUnit(product)) {
+      openBillingQuantityModal(product);
+      return;
+    }
+    addBillingProduct(product, true);
+  }
+
+  function removeBillingRow(index: number) {
+    setBillingItems((items) => {
+      const next = items.filter((_, itemIndex) => itemIndex !== index);
+      setSelectedRow((current) => {
+        if (!next.length || current === null) return null;
+        if (index < current) return current - 1;
+        if (index === current) return Math.min(current, next.length - 1);
+        return current;
+      });
+      return next;
+    });
+  }
+
+  function billingOrderLines(): OrderLine[] {
+    return billingItems.map((item) => {
+      const product = products.find((entry) => entry.id === item.productId);
+      return {
+        id: item.id,
+        type: "standard" as const,
+        product: product ? { ...product, price: item.rate, gstRate: item.gst } : { id: item.productId, name: item.name, sku: item.sku, category: "General", gstRate: item.gst, price: item.rate, stock: 0, unitType: "piece", barcode: item.sku },
+        qty: item.qty,
+        discount: item.discount > 0 ? { mode: "amount" as const, value: item.discount } : undefined,
+      };
+    });
+  }
+
+  async function completeBilling(paymentMethod: PaymentMethod, payableTotal = billSummary.total, extraDiscountAmount = 0, discountMode?: DiscountInput["mode"], discountValue?: number) {
+    if (!billingItems.length || !selectedSalesperson) {
+      setSalespersonTouched(true);
+      showToast(!billingItems.length ? "Add items before payment" : "Please select a salesperson to continue");
+      return;
+    }
+    const lines = billingOrderLines();
+    const invoiceCustomer = selectedCustomer?.name ?? "Walk-in";
+    const invoice: Invoice = {
+      id: `INV-${String(Date.now()).slice(-4)}`,
+      date: displayDateTime(new Date()),
+      customer: invoiceCustomer,
+      customerId: selectedCustomer?.id,
+      items: `${lines.length} item${lines.length === 1 ? "" : "s"}`,
+      total: payableTotal,
+      discount: billDiscount + extraDiscountAmount,
+      discountMode,
+      discountValue,
+      discountBreakdown: { itemDiscount: billSummary.discount - billDiscount, billDiscount: billDiscount + extraDiscountAmount },
+      gst: billSummary.gst,
+      payment: paymentMethod === "QR Code" ? "Qr" : paymentMethod,
+      status: "Completed",
+      staff: selectedSalesperson.name,
+      salespersonId: selectedSalesperson.id,
+      salespersonName: selectedSalesperson.name,
+      lines,
+    };
+    setInvoices((items) => [invoice, ...items]);
+    setProducts((items) => items.map((product) => {
+      const soldQty = billingItems.filter((item) => item.productId === product.id).reduce((sum, item) => sum + item.qty, 0);
+      return soldQty ? { ...product, stock: Math.max(0, product.stock - soldQty) } : product;
+    }));
+    setStockMovements((items) => [
+      ...billingItems.map((item) => {
+        const product = products.find((entry) => entry.id === item.productId);
+        return {
+          id: `SM-${invoice.id}-${item.id}`,
+          productId: item.productId,
+          productName: item.name,
+          type: "sale" as const,
+          quantity: -item.qty,
+          balanceAfter: Math.max(0, (product?.stock ?? 0) - item.qty),
+          referenceId: invoice.id,
+          referenceType: "sale" as const,
+          date: new Date().toISOString(),
+          notes: `Billing mode sale ${invoice.id}`,
+          createdBy: selectedSalesperson.name,
+        };
+      }),
+      ...items,
+    ]);
+    setLedgerEntries((items) => entriesWithRunningBalance(items, createSaleLedgerEntries(invoice)));
+    setPreviousBillNo(billNo);
+    setBillNo(`BILL-${String(Date.now()).slice(-5)}`);
+    setBillingItems([]);
+    setSelectedRow(null);
+    setBillDiscount(0);
+    setPaymentOpen(false);
+    choosePosCustomer(null);
+    const printed = await printInvoiceWithSettings(invoice, paymentSettings, businessInfo);
+    showToast(printed ? `Invoice ${invoice.id} printed` : `Invoice ${invoice.id} created`);
+  }
+
+  useEffect(() => {
+    const gross = billingItems.reduce((sum, item) => sum + item.qty * item.rate, 0);
+    const lineDiscount = billingItems.reduce((sum, item) => sum + item.discount, 0);
+    const billLevelDiscount = Math.max(0, Math.min(Number(billDiscount) || 0, Math.max(0, gross - lineDiscount)));
+    const factorBase = Math.max(0, gross - lineDiscount);
+    const factor = factorBase > 0 ? Math.max(0, factorBase - billLevelDiscount) / factorBase : 1;
+    const gst = billingItems.reduce((sum, item) => sum + item.gstAmt * factor, 0);
+    const cgst = gst / 2;
+    const sgst = gst / 2;
+    const total = Math.max(0, factorBase - billLevelDiscount + gst);
+    setBillSummary({
+      totalQty: billingItems.reduce((sum, item) => sum + item.qty, 0),
+      gross,
+      discount: lineDiscount + billLevelDiscount,
+      gst,
+      cgst,
+      sgst,
+      total,
+      grossAmount: gross.toFixed(2),
+      billDiscount: billLevelDiscount.toFixed(2),
+      totalDiscount: (lineDiscount + billLevelDiscount).toFixed(2),
+      totalGst: gst.toFixed(2),
+      netPayable: total.toFixed(2),
+    });
+  }, [billingItems, billDiscount]);
+
+  useEffect(() => {
+    if (!billingMode) return undefined;
+    setBillingNow(new Date());
+    setBillNo((current) => current || `BILL-${String(invoices.length + 1).padStart(4, "0")}`);
+    const tick = window.setInterval(() => setBillingNow(new Date()), 1000);
+    window.setTimeout(() => skuInputRef.current?.focus(), 0);
+    return () => window.clearInterval(tick);
+  }, [billingMode, invoices.length]);
+
+  useEffect(() => {
+    if (typeof localStorage === "undefined" || typeof sessionStorage === "undefined") return;
+    const userPref = localStorage.getItem("pos_mode");
+    const toastKey = `pos_mode_info_seen_${businessType}`;
+    if (!userPref && businessTypeConfig.defaultMode === "billing" && !sessionStorage.getItem(toastKey)) {
+      sessionStorage.setItem(toastKey, "true");
+      showToast(`Billing Mode enabled for ${businessTypeConfig.label}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    setBillingMode((businessInfo.posMode ?? "card") === "grid");
+  }, [businessInfo.posMode]);
+
+  useEffect(() => {
+    if (!billingMode) return undefined;
+    let barcodeBuffer = "";
+    let lastKeyTime = 0;
+    let bufferTimer: number | undefined;
+
+    const clearBuffer = () => {
+      barcodeBuffer = "";
+      if (bufferTimer) window.clearTimeout(bufferTimer);
+      bufferTimer = undefined;
+    };
+
+    const handleScannerKey = (event: KeyboardEvent) => {
+      const activeEl = document.activeElement as HTMLElement | null;
+      const isTypingElsewhere = activeEl && (
+        (activeEl.tagName === "INPUT" && activeEl !== skuInputRef.current && (activeEl as HTMLInputElement).type !== "hidden") ||
+        activeEl.tagName === "TEXTAREA" ||
+        activeEl.tagName === "SELECT"
+      );
+      if (isTypingElsewhere) return;
+
+      const now = Date.now();
+      const timeDiff = now - lastKeyTime;
+      lastKeyTime = now;
+
+      if (event.key === "Enter") {
+        if (barcodeBuffer.length >= 3) {
+          event.preventDefault();
+          processBillingBarcode(barcodeBuffer.trim());
+        }
+        clearBuffer();
+        return;
+      }
+
+      if (event.key.length !== 1) return;
+
+      if (timeDiff < 50 || barcodeBuffer.length === 0) {
+        barcodeBuffer += event.key;
+      } else {
+        barcodeBuffer = event.key;
+      }
+
+      if (bufferTimer) window.clearTimeout(bufferTimer);
+      bufferTimer = window.setTimeout(() => {
+        barcodeBuffer = "";
+      }, 500);
+    };
+
+    window.addEventListener("keydown", handleScannerKey);
+    return () => {
+      window.removeEventListener("keydown", handleScannerKey);
+      if (bufferTimer) window.clearTimeout(bufferTimer);
+    };
+  }, [billingMode, products, billingItems]);
 
   useEffect(() => {
     const stateCustomerId = (location.state as { customerId?: string } | null)?.customerId;
@@ -1320,7 +2034,7 @@ function POS() {
     };
   }, []);
 
-  async function completePayment(paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) {
+  async function completePayment(paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number, discountMode?: DiscountInput["mode"], discountValue?: number) {
     if (!order.length || !selectedSalesperson) {
       setSalespersonTouched(true);
       return;
@@ -1334,6 +2048,9 @@ function POS() {
       items: `${order.length} items`,
       total: payableTotal,
       discount: discountAmount,
+      discountMode,
+      discountValue,
+      discountBreakdown: { itemDiscount: totals.itemDiscount, billDiscount: discountAmount },
       gst: totals.gst,
       payment: paymentMethod === "QR Code" ? "Qr" : paymentMethod,
       status: "Completed",
@@ -1373,7 +2090,7 @@ function POS() {
     choosePosCustomer(null);
     setSelectedSalespersonId(currentUser?.id ?? selectedSalesperson.id);
     setSalespersonTouched(false);
-    const printed = await printInvoice(invoice);
+    const printed = await printInvoiceWithSettings(invoice, paymentSettings, businessInfo);
     showToast(printed ? `Invoice ${invoice.id} printed` : `Invoice ${invoice.id} created`);
   }
 
@@ -1393,14 +2110,186 @@ function POS() {
     window.addEventListener("mouseup", onUp);
   }
 
+  const quantityTotalLength = Math.max(0, quantityPieces) * Math.max(0, quantityLength);
+  const quantityBasePrice = Number(quantityModalProduct?.price) || 0;
+  const quantityValue = quantityBasePrice * quantityTotalLength;
+  const quantityGstRate = Number(quantityModalProduct?.gstRate) || 0;
+  const quantityGstAmount = quantityValue * quantityGstRate / 100;
+  const quantityTotal = quantityValue + quantityGstAmount;
+
+  function confirmBillingQuantity() {
+    if (!quantityModalProduct || quantityTotalLength <= 0) return;
+    addBillingProduct(quantityModalProduct, true, quantityTotalLength);
+    closeBillingQuantityModal();
+  }
+
+  function toggleBillingMode(value: boolean) {
+    setBillingMode(value);
+    setBusinessInfo((info) => ({ ...info, posMode: value ? "grid" : "card" }));
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("pos_mode", value ? "billing" : "normal");
+    }
+  }
+
   return (
     <section className="page pos-page">
       <div className="page-header">
         <div>
           <h1>Point of Sale</h1>
         </div>
+        <div className="pos-header-actions">
+          <div className="pos-mode-toggle" aria-label="POS mode">
+            <button type="button" className={!billingMode ? "active" : ""} onClick={() => toggleBillingMode(false)}>Card View</button>
+            <button type="button" className={billingMode ? "active" : ""} onClick={() => toggleBillingMode(true)}>Grid View</button>
+          </div>
+          {billingMode ? <button className="outline billing-exit-button" onClick={() => toggleBillingMode(false)}>Exit Grid</button> : null}
+        </div>
       </div>
-      <div className="pos-layout" style={{ "--order-width": `${orderWidth}px` } as React.CSSProperties}>
+      {false ? (
+        <div className="billing-mode-shell">
+          <div className="billing-workspace">
+            <div className="pos-sticky-header billing-pos-header">
+              <div className="billing-bill-head">
+                <label><span>Bill No</span><input value={billNo} onChange={(event) => setBillNo(event.target.value)} /></label>
+                <label><span>Date</span><input readOnly value={billingDate} /></label>
+                <label><span>Salesperson</span><select value={selectedSalespersonId} onChange={(event) => { setSelectedSalespersonId(event.target.value); setSalespersonTouched(true); }}>{salespersonOptions.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
+              </div>
+
+              <div className="billing-customer-bar">
+                <label><span>Customer</span><div className="pos-customer-picker pos-customer-combobox"><input ref={billingCustomerRef} value={customerQuery} onFocus={() => setCustomerDropdownOpen(true)} onBlur={() => window.setTimeout(() => setCustomerDropdownOpen(false), 120)} onChange={(event) => { setCustomerQuery(event.target.value); setSelectedCustomerId(""); setCustomerDropdownOpen(true); }} placeholder="Walk-in or search customer" />{customerDropdownOpen ? <div className="pos-customer-dropdown"><button type="button" className={!selectedCustomer ? "active" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => choosePosCustomer(null)}>Walk-in</button>{customerMatches.map((customer) => <button type="button" key={customer.id} className={selectedCustomerId === customer.id ? "active" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => choosePosCustomer(customer)}>{customer.name}{customer.phone ? ` · ${customer.phone}` : ""}</button>)}{customerQuery.trim() && customerQuery.trim().toLowerCase() !== "walk-in" && !selectedCustomer ? <button type="button" className="add-new" onMouseDown={(event) => event.preventDefault()} onClick={addInlinePosCustomer}>+ Add New Customer</button> : null}</div> : null}</div></label>
+                <label><span>Phone</span><input value={selectedCustomer?.phone ?? ""} readOnly placeholder="-" /></label>
+              </div>
+              {salespersonTouched && !selectedSalesperson ? <div className="salesperson-warning">Please select a salesperson to continue</div> : null}
+
+              <form className="billing-sku-row" onSubmit={handleBillingSkuSubmit}>
+                <div><ScanBarcode size={17} /><input ref={skuInputRef} value={billingSku} onChange={(event) => setBillingSku(event.target.value)} placeholder="Scan / enter SKU, PLU, barcode or product name" list="billing-products" /></div>
+                <span className="scanner-ready-indicator"><i />Scanner Ready</span>
+                <button type="submit">Add</button>
+                <datalist id="billing-products">{products.map((product) => <option key={product.id} value={product.sku}>{product.name}</option>)}</datalist>
+              </form>
+            </div>
+
+            <div className="billing-main">
+              <div className="billing-table-card">
+                <div className="billing-table-wrap" ref={tableRef}>
+                  <table className="billing-table">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Item Name</th>
+                        <th>SKU</th>
+                        <th>Qty</th>
+                        <th>Rate</th>
+                        <th>Disc</th>
+                        <th>GST%</th>
+                        <th>Value</th>
+                        <th>CGST</th>
+                        <th>SGST</th>
+                        <th>Total</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {billingItems.length ? billingItems.map((item, index) => (
+                        <tr key={item.id} className={`${selectedRow === index ? "selected-row" : ""} ${highlightedRow === index ? "highlighted-row" : ""}`} onClick={() => setSelectedRow(index)}>
+                          <td>{index + 1}</td>
+                          <td><strong>{item.name}</strong></td>
+                          <td>{item.sku}</td>
+                          <td><input data-billing-qty={index} type="number" min="0" step="0.01" value={item.qty} onChange={(event) => updateBillingItem(index, "qty", Number(event.target.value))} /></td>
+                          <td>{INR.format(item.rate)}</td>
+                          <td><input data-billing-discount={index} type="number" min="0" step="0.01" value={item.discount} onChange={(event) => updateBillingItem(index, "discount", Number(event.target.value))} /></td>
+                          <td>{item.gst}</td>
+                          <td>{INR.format(item.value)}</td>
+                          <td>{INR.format(item.cgst)}</td>
+                          <td>{INR.format(item.sgst)}</td>
+                          <td><strong>{INR.format(item.total)}</strong></td>
+                          <td><button type="button" className="billing-row-remove" aria-label={`Remove ${item.name}`} onClick={(event) => { event.stopPropagation(); removeBillingRow(index); }}><Trash2 size={14} /></button></td>
+                        </tr>
+                      )) : (
+                        <tr><td colSpan={12}>
+                          <div className="billing-empty-state">
+                            <div className="billing-empty-icon"><ShoppingCart size={42} /></div>
+                            <div>
+                              <p>No items in bill</p>
+                              <span>Scan barcode or search product above</span>
+                            </div>
+                          </div>
+                        </td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <aside className="billing-summary-card">
+                <h3>Bill Summary</h3>
+                <div><span>Total Items</span><strong>{billSummary.totalQty}</strong></div>
+                <div><span>Gross Amount</span><strong>{INR.format(Number(billSummary.grossAmount) || 0)}</strong></div>
+                <label><span>Bill Discount</span><input ref={billDiscountRef} type="number" min="0" step="0.01" value={billDiscount} onChange={(event) => setBillDiscount(Number(event.target.value) || 0)} /></label>
+                <div><span>Total Discount</span><strong>{INR.format(Number(billSummary.totalDiscount) || 0)}</strong></div>
+                <div><span>CGST</span><strong>{INR.format(billSummary.cgst)}</strong></div>
+                <div><span>SGST</span><strong>{INR.format(billSummary.sgst)}</strong></div>
+                <div><span>Total GST</span><strong>{INR.format(Number(billSummary.totalGst) || 0)}</strong></div>
+                <div className="billing-grand-total"><span>Net Payable</span><strong>{INR.format(Number(billSummary.netPayable) || 0)}</strong></div>
+                <button className="primary full charge" disabled={!billingItems.length} onClick={() => setPaymentOpen(true)}>Charge {INR.format(Number(billSummary.netPayable) || 0)}</button>
+                {previousBillNo ? <small>Previous bill: {previousBillNo}</small> : null}
+              </aside>
+            </div>
+
+          </div>
+          {quantityModalProduct ? (
+            <div className="billing-quantity-backdrop">
+              <div className="billing-quantity-modal">
+                <div className="billing-quantity-head">
+                  <div>
+                    <h3>Enter Quantity — {quantityModalProduct?.name}</h3>
+                    <p>{INR.format(quantityBasePrice)} per {quantityUnit} · GST {quantityGstRate}%</p>
+                  </div>
+                  <button type="button" onClick={closeBillingQuantityModal}>×</button>
+                </div>
+                <div className="billing-quantity-divider" />
+                <label className="billing-quantity-label">No. of Pieces</label>
+                <div className="billing-piece-stepper">
+                  <button type="button" onClick={() => setQuantityPieces((value) => Math.max(1, value - 1))}>−</button>
+                  <input type="number" min="1" step="1" value={quantityPieces} onChange={(event) => setQuantityPieces(Math.max(1, Number(event.target.value) || 1))} />
+                  <button type="button" onClick={() => setQuantityPieces((value) => value + 1)}>+</button>
+                </div>
+                <div className="billing-quantity-grid">
+                  <label>
+                    <span>Length per Piece</span>
+                    <input type="number" min="0.1" step="0.1" value={quantityLength} onChange={(event) => setQuantityLength(Math.max(0.1, Number(event.target.value) || 0.1))} />
+                  </label>
+                  <label>
+                    <span>Unit</span>
+                    <select value={quantityUnit} onChange={(event) => setQuantityUnit(event.target.value)}>
+                      <option value="m">m</option>
+                      <option value="cm">cm</option>
+                      <option value="kg">kg</option>
+                      <option value="g">g</option>
+                      <option value="litre">litre</option>
+                      <option value="ml">ml</option>
+                      <option value="ft">ft</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="billing-quantity-preview">
+                  <p>{quantityPieces} × {quantityLength} {quantityUnit} = {quantityTotalLength.toFixed(2)} {quantityUnit}s</p>
+                  <p>{INR.format(quantityBasePrice)}/{quantityUnit} × {quantityTotalLength.toFixed(2)} {quantityUnit} = {INR.format(quantityValue)}</p>
+                  <p>+ GST ({quantityGstRate}%): {INR.format(quantityGstAmount)}</p>
+                  <strong>Total: {INR.format(quantityTotal)}</strong>
+                </div>
+                <div className="billing-quantity-actions">
+                  <button type="button" onClick={closeBillingQuantityModal}>Cancel</button>
+                  <button type="button" onClick={confirmBillingQuantity}>Add to Order →</button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {paymentOpen && <PaymentModal total={billSummary.total} itemCount={billSummary.totalQty} productCount={billingItems.length} onClose={() => setPaymentOpen(false)} onConfirm={completeBilling} />}
+        </div>
+      ) : null}
+      {true ? (
+      <div className={`pos-layout ${billingMode ? "pos-grid-mode" : ""}`} style={{ "--order-width": `${orderWidth}px` } as React.CSSProperties}>
       <div className="pos-products">
         <div className={`pos-sticky-header ${isProductGridScrolled ? "scrolled" : ""}`}>
           <div className="pos-action-row">
@@ -1437,29 +2326,110 @@ function POS() {
             </div>
           </div>
           {salespersonTouched && !selectedSalesperson ? <div className="salesperson-warning">Please select a salesperson to continue</div> : null}
-          <div className="category-row"><button className="arrow-btn"><ChevronLeft size={16} /></button><div className="category-pills">{categories.map((c) => <button key={c} className={`chip ${category === c ? "active" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}</div><button className="arrow-btn"><ChevronRight size={16} /></button></div>
+          {!billingMode ? <div className="category-row"><button className="arrow-btn"><ChevronLeft size={16} /></button><div className="category-pills">{categories.map((c) => <button key={c} className={`chip ${category === c ? "active" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}</div><button className="arrow-btn"><ChevronRight size={16} /></button></div> : null}
         </div>
         <div className="product-scroll-area" onScroll={(event) => setIsProductGridScrolled(event.currentTarget.scrollTop > 10)}>
-          <div className="product-overview">
-            <span>{productOverviewText}</span>
-            {category !== "All" ? <strong>{category}</strong> : null}
-          </div>
-          <div className="product-grid">
-            {filtered.length ? filtered.map((product) => (
-              <ProductCard key={product.id} product={product} onClick={() => addProduct(product)} />
-            )) : <div className="empty compact">No Data Available</div>}
-          </div>
+          {billingMode ? (
+            <div className="billing-table-card pos-grid-billing-table">
+              <div className="billing-table-wrap" ref={tableRef}>
+                <table className="billing-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Item</th>
+                      <th>Qty</th>
+                      <th>Rate</th>
+                      <th>Disc</th>
+                      <th>GST</th>
+                      <th>Amount</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {order.map((line, index) => {
+                      const amount = amountForLine(line);
+                      const quantity = orderLineQuantity(line);
+                      const quantityStep = line.type === "standard" && line.product.unitType === "piece" ? 1 : 0.01;
+                      const updateQuantity = (nextQuantity: number) => {
+                        const nextQty = Math.max(0, nextQuantity);
+                        setOrder((items) => items.flatMap((item) => {
+                          if (item.id !== line.id) return [item];
+                          if (nextQty <= 0) return [];
+                          return item.type === "standard" ? [{ ...item, qty: nextQty }] : [{ ...item, totalMeters: nextQty }];
+                        }));
+                      };
+                      return (
+                      <tr key={line.id} className={`${selectedRow === index ? "selected-row" : ""}`} onClick={() => setSelectedRow(index)}>
+                        <td>{index + 1}</td>
+                        <td>
+                          <div className="grid-item-cell">
+                            <strong>{line.product.name}</strong>
+                            <small>{line.product.sku}</small>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="grid-qty-stepper">
+                            <button type="button" aria-label={`Decrease ${line.product.name} quantity`} onClick={(event) => { event.stopPropagation(); updateQuantity(quantity - quantityStep); }}>−</button>
+                            <input type="number" min="0" step={quantityStep} value={quantity} onClick={(event) => event.stopPropagation()} onChange={(event) => updateQuantity(Number(event.target.value) || 0)} />
+                            <button type="button" aria-label={`Increase ${line.product.name} quantity`} onClick={(event) => { event.stopPropagation(); updateQuantity(quantity + quantityStep); }}>+</button>
+                          </div>
+                        </td>
+                        <td>{INR.format(line.product.price)}</td>
+                        <td>{amount.itemDiscount > 0 ? `-${INR.format(amount.itemDiscount)}` : "—"}</td>
+                        <td>{line.product.gstRate}%</td>
+                        <td><strong>{INR.format(amount.total)}</strong></td>
+                        <td><button type="button" className="billing-row-remove" aria-label={`Remove ${line.product.name}`} onClick={(event) => { event.stopPropagation(); setOrder((items) => items.filter((item) => item.id !== line.id)); }}><Trash2 size={14} /></button></td>
+                      </tr>
+                    );
+                    })}
+                    {Array.from({ length: Math.max(0, 10 - order.length) }, (_, index) => (
+                      <tr className="billing-placeholder-row" key={`placeholder-${index}`}>
+                        <td>{order.length + index + 1}</td>
+                        <td colSpan={7}>{index === 0 && order.length === 0 ? <span>Search product or scan barcode to add your first item...</span> : null}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="product-overview">
+                <span>{productOverviewText}</span>
+                {category !== "All" ? <strong>{category}</strong> : null}
+              </div>
+              <div className="product-grid">
+                {filtered.length ? filtered.map((product) => (
+                  <ProductCard key={product.id} product={product} onClick={() => addProduct(product)} />
+                )) : <div className="empty compact">No Data Available</div>}
+              </div>
+            </>
+          )}
         </div>
       </div>
       <div className="order-resizer" title="Drag to resize current order" onMouseDown={startOrderResize} />
       <aside className="order-panel">
         <div className="order-head"><div className="order-title-wrap"><h2>Current Order</h2>{order.length > 0 ? <span className="order-count-badge">{orderQuantity} item{orderQuantity === 1 ? "" : "s"}</span> : null}</div><button className="danger-light" onClick={() => setOrder([])}><Trash2 size={16} />Clear</button></div>
-        <div className="order-lines">
-          {order.length === 0 ? <div className="empty-order-state"><div className="empty-order-box"><ShoppingBag size={40} /><strong>No items yet</strong><span>Tap a product to add it to this order</span></div></div> : order.map((line) => <OrderLineRow key={line.id} line={line} />)}
-        </div>
+        {!billingMode ? <div className="order-lines">
+          {order.length === 0 ? (
+            <div className="empty-order-state">
+              <div className="empty-order-box order-empty-guidance">
+                <ShoppingCart size={40} />
+                <strong>No items in the order</strong>
+                <ul>
+                  <li>Scan a barcode</li>
+                  <li>Search for a product</li>
+                  <li>Select from Card View</li>
+                </ul>
+                <span>The bill summary will appear here after adding items.</span>
+              </div>
+            </div>
+          ) : order.map((line) => <OrderLineRow key={line.id} line={line} />)}
+        </div> : null}
         <div className="totals">
           <div className="total-items-row"><span>Total Items</span><strong>{orderQuantity} ({order.length} product{order.length === 1 ? "" : "s"})</strong></div>
-          <div><span>Subtotal:</span><strong>{INR.format(totals.base)}</strong></div>
+          <div><span>Subtotal:</span><strong>{INR.format(totals.grossBase)}</strong></div>
+          {totals.itemDiscount > 0 ? <div><span>Item Discounts:</span><strong>-{INR.format(totals.itemDiscount)}</strong></div> : null}
           <div><span>Total GST:</span><strong>{INR.format(totals.gst)}</strong></div>
           <hr />
           <div className="payable"><span>Total Payable:</span><strong>{INR.format(totals.total)}</strong></div>
@@ -1470,6 +2440,7 @@ function POS() {
       {paymentOpen && <PaymentModal total={totals.total} itemCount={orderQuantity} productCount={order.length} onClose={() => setPaymentOpen(false)} onConfirm={completePayment} />}
       <BarcodeScannerModal visible={scannerOpen} prewarmedStream={prewarmedStreamRef.current} onClose={() => { setScannerOpen(false); prewarmedStreamRef.current = null; }} onManual={() => { setScannerOpen(false); prewarmedStreamRef.current = null; barcodeInputRef.current?.focus(); }} onScanned={handleScannerCode} />
       </div>
+      ) : null}
     </section>
   );
 }
@@ -1638,6 +2609,22 @@ function OrderLineRow({ line }: { line: OrderLine }) {
   const amount = amountForLine(line);
   const [fabricPiecesDraft, setFabricPiecesDraft] = useState(line.type === "fabric" ? String(line.pieces) : "");
   const [fabricLengthDraft, setFabricLengthDraft] = useState(line.type === "fabric" ? String(line.lengthPerPiece) : "");
+  const setLineDiscount = (patch: Partial<DiscountInput>) => {
+    setOrder((items) => items.map((item) => {
+      if (item.id !== line.id) return item;
+      const current = item.discount ?? { mode: "percent" as const, value: 0 };
+      const next = { ...current, ...patch };
+      return { ...item, discount: next.value > 0 ? next : undefined };
+    }));
+  };
+  const discountControl = (
+    <div className="line-discount-control">
+      <span>Discount</span>
+      <input type="number" min="0" step={line.discount?.mode === "amount" ? "0.01" : "1"} value={line.discount?.value ?? ""} onChange={(e) => setLineDiscount({ value: Number(e.target.value) || 0 })} placeholder="0" />
+      <button className={line.discount?.mode !== "amount" ? "active" : ""} onClick={() => setLineDiscount({ mode: "percent" })}>%</button>
+      <button className={line.discount?.mode === "amount" ? "active" : ""} onClick={() => setLineDiscount({ mode: "amount" })}>₹</button>
+    </div>
+  );
 
   useEffect(() => {
     if (line.type !== "fabric") return;
@@ -1691,6 +2678,8 @@ function OrderLineRow({ line }: { line: OrderLine }) {
           <label><span>Unit</span><select value={line.unit} onChange={(e) => updateFabric({ unit: e.target.value as "m" | "yd" })}><option>m</option><option>yd</option></select></label>
         </div>
         <small>{line.pieces} pcs × {line.lengthPerPiece}{line.unit} = {line.totalMeters.toFixed(2)}m @ {INR.format(line.product.price)}/m</small>
+        {discountControl}
+        {amount.itemDiscount > 0 ? <small className="line-tax">Discount {formatDiscountLabel(line.discount)} · -{INR.format(amount.itemDiscount)}</small> : null}
         <small className="line-tax">Base {INR.format(amount.base)} · GST {INR.format(amount.gst)}</small>
         <div className="line-main"><span className="muted">Line total</span><b>{INR.format(amount.total)}</b></div>
       </div>
@@ -1701,6 +2690,8 @@ function OrderLineRow({ line }: { line: OrderLine }) {
     <div className="order-line">
       <div className="line-main"><strong>{line.product.name}</strong><span className="line-actions"><b>{INR.format(amount.total)}</b><button className="remove-line" title="Remove item" onClick={() => setOrder((items) => items.filter((item) => item.id !== line.id))}><Trash2 size={15} /></button></span></div>
       <small>{INR.format(line.product.price)}/{unitLabel(line.product.unitType)}</small>
+      {discountControl}
+      {amount.itemDiscount > 0 ? <small className="line-tax">Discount {formatDiscountLabel(line.discount)} · -{INR.format(amount.itemDiscount)}</small> : null}
       <div className="qty-row">
         <button onClick={() => setOrder((items) => items.flatMap((item) => item.id === line.id ? (line.qty - step > 0 ? [{ ...line, qty: line.qty - step }] : []) : [item]))}>−</button>
         <span>{line.qty}</span>
@@ -1711,7 +2702,7 @@ function OrderLineRow({ line }: { line: OrderLine }) {
   );
 }
 
-function PaymentModal({ total, itemCount, productCount, onClose, onConfirm }: { total: number; itemCount: number; productCount: number; onClose: () => void; onConfirm: (paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number) => void | Promise<void> }) {
+function PaymentModal({ total, itemCount, productCount, onClose, onConfirm }: { total: number; itemCount: number; productCount: number; onClose: () => void; onConfirm: (paymentMethod: PaymentMethod, payableTotal: number, discountAmount: number, discountMode?: DiscountInput["mode"], discountValue?: number) => void | Promise<void> }) {
   const [method, setMethod] = useState<PaymentMethod>("Card");
   const [discountDraft, setDiscountDraft] = useState("");
   const [discountMode, setDiscountMode] = useState<"percent" | "amount">("percent");
@@ -1761,7 +2752,7 @@ function PaymentModal({ total, itemCount, productCount, onClose, onConfirm }: { 
           {cashShort && <small>Received cash must be at least {INR.format(payableTotal)}.</small>}
         </div>
       )}
-      <button className="primary full" disabled={cashShort} onClick={() => onConfirm(method, payableTotal, discountAmount)}>
+      <button className="primary full" disabled={cashShort} onClick={() => onConfirm(method, payableTotal, discountAmount, discountAmount > 0 ? discountMode : undefined, discountAmount > 0 ? discountValue : undefined)}>
         Confirm {method} Payment
       </button>
     </Modal>
@@ -1851,10 +2842,10 @@ function Sales() {
   return (
     <section className="page sales-page">
       <PageHeader title="Sales History" subtitle="View and manage transaction records." action={access.canExportSales ? <button className="outline sales-export-button" onClick={() => setExportOpen(true)}>Export</button> : null} />
-      <div className="filters sales-filters"><label className="searchbox sales-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search invoice, customer, or staff" /></label><select value={method} onChange={(e) => setMethod(e.target.value)}><option>All Methods</option><option>Card</option><option>Cash</option><option>Qr</option></select><select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id}>{member.name}</option>)}</select><DateInput value={dateFilter} onChange={(date) => setDateFilter(date ? dateInputKey(date) : "")} /></div>
+      <div className="filters sales-filters"><label className="searchbox sales-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search invoice, customer, or staff" /></label><select value={method} onChange={(e) => setMethod(e.target.value)}><option>All Methods</option><option>Card</option><option>Cash</option><option>Qr</option></select><select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}><option>All Staff</option>{staff.map((member) => <option key={member.id}>{member.name}</option>)}</select><DatePicker value={dateFilter} onChange={(date) => setDateFilter(date ? dateInputKey(date) : "")} /></div>
       <div className="sales-summary">
-        <div><span>Total invoices</span><strong>{filtered.length}</strong></div>
-        {access.canViewSalesTotals ? <div><span>Total amount</span><strong>{INR.format(filteredTotal)}</strong></div> : null}
+        <CompactStatCard icon={<ClipboardList />} value={filtered.length} label="Total invoices" />
+        {access.canViewSalesTotals ? <CompactStatCard icon={<ShoppingBag />} value={INR.format(filteredTotal)} label="Total amount" /> : null}
       </div>
       <DataTable headers={["Invoice", "Date", "Customer", "Items", "Total", "Payment", "Status", "Salesperson", "Actions"]}>
         {filtered.length === 0 ? (
@@ -1879,6 +2870,7 @@ function Sales() {
 }
 
 function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit, onSave }: { invoice: Invoice; mode: "view" | "edit"; canEdit: boolean; staff: Staff[]; products: Product[]; onClose: () => void; onEdit: () => void; onSave: (invoice: Invoice) => void }) {
+  const { paymentSettings, businessInfo } = useApp();
   const [customer, setCustomer] = useState(invoice.customer);
   const [payment, setPayment] = useState(invoice.payment);
   const [status, setStatus] = useState<Invoice["status"]>(invoice.status);
@@ -2025,7 +3017,7 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
             </> : <><span>Total Amount</span><strong>{INR.format(displayedViewTotal)}</strong></>}
           </div>
         </div>
-        <div className="modal-actions">{canEdit ? <button className="outline edit-bill-button" onClick={onEdit}>Edit Bill</button> : null}<button className="outline" onClick={() => printInvoice(viewInvoice)}>Print Bill</button><button className="outline" onClick={onClose}>Close</button></div>
+        <div className="modal-actions">{canEdit ? <button className="outline edit-bill-button" onClick={onEdit}>Edit Bill</button> : null}<button className="outline" onClick={() => printInvoiceWithSettings(viewInvoice, paymentSettings, businessInfo)}>Print Bill</button><button className="outline" onClick={onClose}>Close</button></div>
       </Modal>
     );
   }
@@ -2079,13 +3071,13 @@ function InvoiceModal({ invoice, mode, canEdit, staff, products, onClose, onEdit
         <span>Items: {nextInvoice.items}</span>
         <span>Total: {INR.format(nextInvoice.total)}</span>
       </div>
-      <div className="modal-actions"><button className="outline" onClick={() => printInvoice(nextInvoice)}>Print Bill</button><button className="outline" onClick={() => setStatus(status === "Refunded" ? "Completed" : "Refunded")}>{status === "Refunded" ? "Mark Completed" : "Mark Refunded"}</button><button className="primary" onClick={() => onSave(nextInvoice)}>Save Changes</button></div>
+      <div className="modal-actions"><button className="outline" onClick={() => printInvoiceWithSettings(nextInvoice, paymentSettings, businessInfo)}>Print Bill</button><button className="outline" onClick={() => setStatus(status === "Refunded" ? "Completed" : "Refunded")}>{status === "Refunded" ? "Mark Completed" : "Mark Refunded"}</button><button className="primary" onClick={() => onSave(nextInvoice)}>Save Changes</button></div>
     </Modal>
   );
 }
 
 function Inventory() {
-  const { products, setProducts, staff, showToast } = useApp();
+  const { products, setProducts, setStockMovements, staff, showToast } = useApp();
   const currentUser = staff.find((member) => member.isCurrent) ?? staff[0];
   const access = roleAccess(currentUser.role);
   const [query, setQuery] = useState("");
@@ -2093,6 +3085,7 @@ function Inventory() {
   const [open, setOpen] = useState(false);
   const [barcodePreview, setBarcodePreview] = useState<Product | null>(null);
   const [printProducts, setPrintProducts] = useState<Product[] | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const rows = products.filter((p) => `${p.name} ${p.sku}`.toLowerCase().includes(query.toLowerCase()));
@@ -2104,7 +3097,7 @@ function Inventory() {
   };
   return (
     <section className="page">
-      <PageHeader title="Inventory" subtitle="Manage your products and stock levels." action={<div className="toolbar-actions">{bulkMode ? <><button className="outline" onClick={() => { setBulkMode(false); setSelectedIds([]); }}>Cancel</button><button className="primary" disabled={!selectedIds.length} onClick={() => setPrintProducts(selectedProducts)}>{selectedIds.length} selected · Print Labels</button></> : <><button className="outline" onClick={fixProductCodes}>Fix Codes</button><button className="outline" onClick={() => setBulkMode(true)}>Print Labels</button><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Product</button></>}</div>} />
+      <PageHeader title="Inventory" subtitle="Manage your products and stock levels." action={<div className="toolbar-actions">{bulkMode ? <><button className="outline" onClick={() => { setBulkMode(false); setSelectedIds([]); }}>Cancel</button><button className="primary" disabled={!selectedIds.length} onClick={() => setPrintProducts(selectedProducts)}>{selectedIds.length} selected · Print Labels</button></> : <><button className="outline" onClick={fixProductCodes}>Fix Codes</button><button className="outline" onClick={() => setImportOpen(true)}><Upload size={16} />Import Excel</button><button className="outline" onClick={() => setBulkMode(true)}>Print Labels</button><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Product</button></>}</div>} />
       <label className="searchbox top-search"><Search size={17} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search inventory..." /></label>
       <DataTable headers={[...(bulkMode ? ["Select"] : []), "Product Name", "SKU", "Category", "Unit", "Price", "GST", "Stock", "Actions"]}>
         {rows.length ? rows.map((p) => <tr key={p.id}>{bulkMode ? <td><input type="checkbox" checked={selectedIds.includes(p.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, p.id] : ids.filter((id) => id !== p.id))} /></td> : null}<td><strong>{p.name}</strong>{p.barcode ? <button className="barcode-mini" title="View barcode" onClick={() => setBarcodePreview(p)}><ScanBarcode size={15} /></button> : null}</td><td className="linkish">{p.sku}</td><td>{p.category}</td><td>{unitLabel(p.unitType)}</td><td>{INR.format(p.price)}</td><td><GSTPill rate={p.gstRate} /></td><td><span className={`stock-pill ${p.stock <= 10 ? "low" : ""}`}>{p.stock}</span></td><td className="actions"><button onClick={() => { setEditing(p); setOpen(true); }}><Edit size={16} /></button><button onClick={() => setPrintProducts([p])} title="Print labels"><ScanBarcode size={16} /></button>{access.canDeleteProducts ? <button onClick={() => setProducts((items) => items.filter((item) => item.id !== p.id))}><Trash2 size={16} /></button> : null}</td></tr>) : <tr><td className="empty-table" colSpan={bulkMode ? 9 : 8}>No Data Available</td></tr>}
@@ -2116,6 +3109,13 @@ function Inventory() {
       }} />}
       {barcodePreview && <BarcodePreviewModal product={barcodePreview} onClose={() => setBarcodePreview(null)} onPrint={() => setPrintProducts(barcodePreview ? [barcodePreview] : null)} onCopied={() => showToast("Copied!")} />}
       {printProducts && <PrintLabelsModal products={printProducts} onClose={() => setPrintProducts(null)} />}
+      {importOpen && <InventoryImportModal onClose={() => setImportOpen(false)} onImport={(rows) => {
+        const result = applyExcelRowsToProducts(products as any, rows, currentUser.name);
+        setProducts(result.products as Product[]);
+        setStockMovements((items) => [...result.movements, ...items]);
+        showToast(`Imported ${result.created} new, updated ${result.updated}`);
+        setImportOpen(false);
+      }} />}
     </section>
   );
 }
@@ -2195,10 +3195,83 @@ function ProductModal({ product, onClose, onSave }: { product: Product | null; o
         </div>
       </section>
       <section className="product-form-section">
+        <h3>Stock / Inventory</h3>
+        <div className="product-form-grid">
+          <label className="field">
+            <span>Opening Stock Qty*</span>
+            <input
+              type="number"
+              min="0"
+              step={form.unitType === "piece" ? "1" : "0.001"}
+              value={String(form.stock)}
+              onFocus={(event) => event.currentTarget.select()}
+              onChange={(event) => update("stock", Number(event.target.value) || 0)}
+              placeholder="0"
+            />
+            {form.unitType !== "piece" && (
+              <small className="field-hint">Enter quantity in {form.unitType === "kg" ? "kilograms" : form.unitType === "meter" ? "metres" : "litres"}</small>
+            )}
+          </label>
+          <label className="field">
+            <span>Cost Price</span>
+            <div className="price-prefix-field">
+              <span>₹</span>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={String(form.costPrice ?? "")}
+                onFocus={(event) => event.currentTarget.select()}
+                onChange={(event) => update("costPrice", event.target.value === "" ? undefined : Number(event.target.value))}
+                placeholder="0.00"
+              />
+            </div>
+          </label>
+          <label className="field">
+            <span>GST Rate (%)</span>
+            <select value={form.gstRate} onChange={(event) => update("gstRate", Number(event.target.value))}>
+              <option value={0}>0% — Exempt</option>
+              <option value={5}>5%</option>
+              <option value={12}>12%</option>
+              <option value={18}>18%</option>
+              <option value={28}>28%</option>
+            </select>
+          </label>
+        </div>
+      </section>
+      <section className="product-form-section">
         <label className="product-section-toggle"><input type="checkbox" checked={salesInfoEnabled} onChange={(event) => setSalesInfoEnabled(event.target.checked)} /><span>Sales Information</span></label>
         {salesInfoEnabled ? <div className="product-form-grid">
-          <label className="field"><span>Selling Price*</span><div className="price-prefix-field"><span>₹</span><input type="number" value={String(form.price)} onChange={(event) => update("price", Number(event.target.value))} /></div></label>
-          <label className="field"><span>MRP</span><input type="number" value={String(form.mrp ?? "")} onChange={(event) => update("mrp", event.target.value === "" ? undefined : Number(event.target.value))} /></label>
+          <label className="field">
+            <span>Selling Price*</span>
+            <div className="price-prefix-field">
+              <span>₹</span>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={String(form.price)}
+                onFocus={(event) => event.currentTarget.select()}
+                onChange={(event) => update("price", Number(event.target.value))}
+                placeholder="0.00"
+              />
+            </div>
+          </label>
+          <label className="field">
+            <span>MRP</span>
+            <div className="price-prefix-field">
+              <span>₹</span>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={String(form.mrp ?? "")}
+                onFocus={(event) => event.currentTarget.select()}
+                onChange={(event) => update("mrp", event.target.value === "" ? undefined : Number(event.target.value))}
+                placeholder="0.00"
+              />
+            </div>
+          </label>
           <label className="field product-field-full"><span>Description</span><textarea value={form.description ?? ""} onChange={(event) => update("description", event.target.value)} placeholder="Add product description" /></label>
         </div> : null}
       </section>
@@ -2222,18 +3295,62 @@ function BarcodePreviewModal({ product, onClose, onPrint, onCopied }: { product:
   );
 }
 
+function InventoryImportModal({ onClose, onImport }: { onClose: () => void; onImport: (rows: ParsedExcelProductRow[]) => void }) {
+  const [rows, setRows] = useState<ParsedExcelProductRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  async function readFile(file?: File) {
+    if (!file) return;
+    setLoading(true);
+    try {
+      setRows(await parseExcelBill(file));
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <Modal onClose={onClose} className="wide-modal">
+      <div className="modal-head"><div><h2>Import Inventory Excel</h2><p>Preview stock rows before adding them to inventory.</p></div><button onClick={onClose}><X size={20} /></button></div>
+      <div className="import-toolbar"><label className="outline file-button"><Upload size={15} />Choose Excel<input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => readFile(event.target.files?.[0])} /></label><button className="outline" onClick={makeExcelTemplate}>Download Template</button><span>{loading ? "Reading file..." : `${rows.length} row${rows.length === 1 ? "" : "s"} ready`}</span></div>
+      <DataTable headers={["Product", "SKU", "Category", "Qty", "Unit Cost", "GST"]}>
+        {rows.length ? rows.slice(0, 8).map((row, index) => <tr key={`${row.productName}-${index}`}><td>{row.productName}</td><td>{row.sku || "-"}</td><td>{row.category || "Uncategorized"}</td><td>{row.quantity}</td><td>{INR.format(row.unitCost)}</td><td>{row.gstRate}%</td></tr>) : <tr><td className="empty-table" colSpan={6}>No Data Available</td></tr>}
+      </DataTable>
+      <div className="modal-actions end"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" disabled={!rows.length} onClick={() => onImport(rows)}>Import {rows.length || ""}</button></div>
+    </Modal>
+  );
+}
+
 function PrintLabelsModal({ products, onClose }: { products: Product[]; onClose: () => void }) {
   const [copies, setCopies] = useState(1);
   const [size, setSize] = useState<LabelSize>("medium");
+  const [serialMode, setSerialMode] = useState(false);
   const first = products[0];
   const previewSvg = first ? safeBarcodeSVG(first.barcode || first.sku, { height: size === "large" ? 55 : size === "small" ? 30 : 40, fontSize: 8 }) : "";
+  const updateCopies = (value: number) => setCopies(Math.max(1, Math.min(200, Math.floor(value) || 1)));
+  function print() {
+    if (!serialMode) {
+      printLabels(products.map((product) => ({ product, copies, size })));
+      return;
+    }
+    const serialLabels = products.flatMap((product) => {
+      const existingCount = productSerialService.getByProduct(product.id).length;
+      const serials = generateSerialBarcodes(product, copies, existingCount);
+      productSerialService.add(serials);
+      return serials.map((serial) => ({
+        product: { ...product, barcode: serial.barcode, sku: serial.serialNo },
+        copies: 1,
+        size,
+      }));
+    });
+    printLabels(serialLabels);
+  }
   return (
     <Modal onClose={onClose} className="drawer-modal">
       <div className="modal-head"><div><h2>Print Barcode Labels</h2><p>{products.length === 1 ? products[0].name : `${products.length} products selected`}</p></div><button onClick={onClose}><X size={20} /></button></div>
-      <div className="label-control-row"><span>Copies per product</span><div className="mini-stepper"><button onClick={() => setCopies((value) => Math.max(1, value - 1))}>−</button><strong>{copies}</strong><button onClick={() => setCopies((value) => Math.min(200, value + 1))}>+</button></div></div>
+      <div className="label-control-row"><span>Copies per product</span><div className="mini-stepper"><button onClick={() => updateCopies(copies - 1)}>−</button><input type="number" min="1" value={copies} onChange={(event) => updateCopies(Number(event.target.value))} /><button onClick={() => updateCopies(copies + 1)}>+</button></div></div>
       <div className="label-size-row">{(["small", "medium", "large"] as LabelSize[]).map((item) => <button key={item} className={`chip ${size === item ? "active" : ""}`} onClick={() => setSize(item)}>{item[0].toUpperCase() + item.slice(1)}</button>)}</div>
+      <label className="toggle-line"><input type="checkbox" checked={serialMode} onChange={(event) => setSerialMode(event.target.checked)} /><span>Generate unique serial barcode per label</span></label>
       {first ? <div className="label-preview"><strong>{first.name}</strong><div dangerouslySetInnerHTML={{ __html: previewSvg }} /><span>{INR.format(first.price)} · {first.sku}</span></div> : null}
-      <div className="modal-actions"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" onClick={() => printLabels(products.map((product) => ({ product, copies, size })))}>Print</button></div>
+      <div className="modal-actions"><button className="outline" onClick={onClose}>Cancel</button><button className="primary" onClick={print}>Print</button></div>
     </Modal>
   );
 }
@@ -2244,7 +3361,7 @@ function DateRangeFilter({ mode, setMode, customFrom, setCustomFrom, customTo, s
       <div className="range-filter-pills">
         {(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${mode === item ? "active" : ""}`} onClick={() => setMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}
       </div>
-      {mode === "custom" ? <div className="custom-date-row"><label><span>From</span><DateInput value={customFrom} onChange={(date) => setCustomFrom(date ? dateInputKey(date) : "")} /></label><label><span>To</span><DateInput value={customTo} onChange={(date) => setCustomTo(date ? dateInputKey(date) : "")} /></label></div> : null}
+      {mode === "custom" ? <div className="custom-date-row"><label><span>From</span><DatePicker value={customFrom} onChange={(date) => setCustomFrom(date ? dateInputKey(date) : "")} /></label><label><span>To</span><DatePicker value={customTo} onChange={(date) => setCustomTo(date ? dateInputKey(date) : "")} /></label></div> : null}
     </div>
   );
 }
@@ -2292,10 +3409,16 @@ function Performance() {
 
   return (
     <section className="page">
-      <PageHeader title="Performance" subtitle="Owner-only sales performance and attendance management." action={<DateRangeFilter mode={rangeMode} setMode={setRangeMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />} />
-      <div className="performance-tab-row">
+      <PageHeader title="Performance" subtitle="Owner-only sales performance and attendance management." />
+      <div className="performance-tab-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
         <div className="performance-tabs"><button className={tab === "sales" ? "active" : ""} onClick={() => setTab("sales")}>Sales Performance</button><button className={tab === "attendance" ? "active" : ""} onClick={() => setTab("attendance")}>Attendance</button></div>
         {tab === "sales" ? <button className="outline export-csv-btn" onClick={exportRows}>Export CSV</button> : null}
+      </div>
+      <div className="performance-range-filter" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 0, paddingTop: 0, paddingBottom: 0 }}>
+        <div className="performance-range-pills">
+          {(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${rangeMode === item ? "active" : ""}`} onClick={() => setRangeMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}
+        </div>
+        {rangeMode === "custom" ? <div className="performance-custom-dates"><span>From</span><DatePicker value={customFrom} onChange={(date) => setCustomFrom(date ? dateInputKey(date) : "")} width="148px" /><span>To</span><DatePicker value={customTo} onChange={(date) => setCustomTo(date ? dateInputKey(date) : "")} width="148px" /></div> : null}
       </div>
       {tab === "sales" ? <SalesPerformanceTab invoices={invoices} products={products} staff={staff} range={range} /> : <AttendanceTab staff={staff} owner={owner} attendance={attendance} setAttendance={setAttendance} showToast={showToast} range={range} rangeMode={rangeMode} customFrom={customFrom} customTo={customTo} />}
     </section>
@@ -2314,10 +3437,10 @@ function SalesPerformanceTab({ invoices, products, staff, range }: { invoices: I
   return (
     <>
       <div className="performance-cards">
-        <div><span>Top Performer</span><strong>{top?.salespersonName ?? "No sales"}</strong><small>{top ? `${INR.format(top.netRevenue)} in ${top.salesCount} sales` : "No transactions"}</small></div>
-        <div><span>Total Sales</span><strong>{INR.format(totalSales)}</strong><small>{salesCount} transactions</small></div>
-        <div><span>Active Today</span><strong>{activeToday}</strong><small>Out of {staff.length} members</small></div>
-        <div><span>Avg Sale Value</span><strong>{INR.format(salesCount ? totalSales / salesCount : 0)}</strong><small>Across all staff</small></div>
+        <CompactStatCard icon={<TrendingUp />} value={top?.salespersonName ?? "No sales"} label="Top Performer" detail={top ? `${INR.format(top.netRevenue)} in ${top.salesCount} sales` : "No transactions"} />
+        <CompactStatCard icon={<ShoppingCart />} value={INR.format(totalSales)} label="Total Sales" detail={`${salesCount} transactions`} />
+        <CompactStatCard icon={<Users />} value={activeToday} label="Active Today" detail={`Out of ${staff.length} members`} />
+        <CompactStatCard icon={<BarChart3 />} value={INR.format(salesCount ? totalSales / salesCount : 0)} label="Avg Sale Value" detail="Across all staff" />
       </div>
       <DataTable headers={["Rank", "Salesperson", "Sales Count", "Total Revenue", "Avg Sale", "Returns", "Net Revenue"]}>
         {stats.length ? stats.map((row, index) => {
@@ -2345,48 +3468,61 @@ function MarkAttendance({ staff, owner, attendance, setAttendance, showToast }: 
   const recordsForDate = attendance.filter((record) => record.date === date);
   const makeDrafts = () => staff.map((member) => recordsForDate.find((record) => record.staffId === member.id) ?? { id: `${date}-${member.id}`, staffId: member.id, staffName: member.name, date, status: "present" as AttendanceStatus, checkInTime: "09:30", checkOutTime: "18:00", hoursWorked: 8.5, markedBy: owner.id, markedAt: new Date().toISOString() });
   const [drafts, setDrafts] = useState<AttendanceRecord[]>(makeDrafts);
-  useEffect(() => setDrafts(makeDrafts()), [date, attendance, staff]);
-  const update = (staffId: string, patch: Partial<AttendanceRecord>) => setDrafts((rows) => rows.map((row) => {
-    if (row.staffId !== staffId) return row;
-    const next = { ...row, ...patch };
-    return { ...next, hoursWorked: hoursBetween(next.checkInTime, next.checkOutTime) };
-  }));
+  const draftsRef = useRef<AttendanceRecord[]>(drafts);
+  const setDraftRows = (rows: AttendanceRecord[]) => {
+    draftsRef.current = rows;
+    setDrafts(rows);
+  };
+  useEffect(() => {
+    const next = makeDrafts();
+    draftsRef.current = next;
+    setDrafts(next);
+  }, [date, attendance, staff]);
+  const update = (staffId: string, patch: Partial<AttendanceRecord>, shouldRender = true) => {
+    const nextRows = draftsRef.current.map((row) => {
+      if (row.staffId !== staffId) return row;
+      const next = { ...row, ...patch };
+      return { ...next, hoursWorked: hoursBetween(next.checkInTime, next.checkOutTime) };
+    });
+    draftsRef.current = nextRows;
+    if (shouldRender) setDrafts(nextRows);
+  };
   const copyYesterday = () => {
     const prev = new Date(date);
     prev.setDate(prev.getDate() - 1);
     const key = dateInputKey(prev);
     const previous = attendance.filter((record) => record.date === key);
     if (!previous.length) return;
-    setDrafts(staff.map((member) => {
+    setDraftRows(staff.map((member) => {
       const old = previous.find((record) => record.staffId === member.id);
-      return old ? { ...old, id: `${date}-${member.id}`, date, staffName: member.name, markedAt: new Date().toISOString(), updatedAt: new Date().toISOString() } : drafts.find((record) => record.staffId === member.id)!;
+      return old ? { ...old, id: `${date}-${member.id}`, date, staffName: member.name, markedAt: new Date().toISOString(), updatedAt: new Date().toISOString() } : draftsRef.current.find((record) => record.staffId === member.id)!;
     }));
   };
   const save = () => {
     const timestamp = new Date().toISOString();
-    const nextDrafts = drafts.map((record) => ({ ...record, date, markedBy: owner.id, markedAt: record.markedAt || timestamp, updatedAt: timestamp }));
+    const nextDrafts = draftsRef.current.map((record) => ({ ...record, date, markedBy: owner.id, markedAt: record.markedAt || timestamp, updatedAt: timestamp }));
     setAttendance((rows) => [...rows.filter((record) => record.date !== date), ...nextDrafts]);
     showToast(`Attendance saved for ${date}`);
   };
   return (
     <div className="attendance-panel">
-      <div className="attendance-head"><strong>Attendance — {formatDate(date)}</strong><DateInput value={date} onChange={(nextDate) => setDate(nextDate ? dateInputKey(nextDate) : "")} /></div>
+      <div className="attendance-head"><strong>Attendance — {formatDate(date)}</strong><DatePicker value={date} onChange={(nextDate) => setDate(nextDate ? dateInputKey(nextDate) : "")} /></div>
       {recordsForDate.length ? <div className="success-banner">Attendance marked for this date — tap to edit</div> : null}
-      <div className="attendance-actions"><button className="outline" onClick={() => setDrafts((rows) => rows.map((row) => ({ ...row, status: "present", checkInTime: row.checkInTime || "09:30", checkOutTime: row.checkOutTime || "18:00", hoursWorked: hoursBetween(row.checkInTime || "09:30", row.checkOutTime || "18:00") })))}>Mark All Present</button><button className="outline" onClick={copyYesterday}>Copy Yesterday</button></div>
-      <div className="attendance-list">{drafts.map((record) => <AttendanceRow key={record.staffId} record={record} staff={staff.find((member) => member.id === record.staffId)} update={update} />)}</div>
+      <div className="attendance-actions"><button className="outline" onClick={() => setDraftRows(draftsRef.current.map((row) => ({ ...row, status: "present", checkInTime: row.checkInTime || "09:30", checkOutTime: row.checkOutTime || "18:00", hoursWorked: hoursBetween(row.checkInTime || "09:30", row.checkOutTime || "18:00") })))}>Mark All Present</button><button className="outline" onClick={copyYesterday}>Copy Yesterday</button></div>
+      <div className="attendance-list">{drafts.map((record) => <AttendanceRow key={record.id} record={record} staff={staff.find((member) => member.id === record.staffId)} update={update} />)}</div>
       <button className="primary full" onClick={save}>Save Attendance</button>
     </div>
   );
 }
 
-function AttendanceRow({ record, staff, update }: { record: AttendanceRecord; staff?: Staff; update: (staffId: string, patch: Partial<AttendanceRecord>) => void }) {
+function AttendanceRow({ record, staff, update }: { record: AttendanceRecord; staff?: Staff; update: (staffId: string, patch: Partial<AttendanceRecord>, shouldRender?: boolean) => void }) {
   const showTime = ["present", "late", "half-day"].includes(record.status);
   const duration = hoursLabel(record.checkInTime, record.checkOutTime);
   return (
     <div className={`attendance-row ${record.status}`}>
       <div className="person-cell"><div className="avatar sm">{staffInitials(record.staffName)}</div><strong>{record.staffName}</strong><small>{staff?.role}</small></div>
       <div className="status-pills">{(["present", "absent", "half-day", "late", "leave"] as AttendanceStatus[]).map((status) => <button key={status} className={`${status} ${record.status === status ? "active" : ""}`} onClick={() => update(record.staffId, { status })}>{statusShort(status)}</button>)}</div>
-      {showTime ? <div className="time-section"><span><input className="attendance-time-input" type="time" value={record.checkInTime ?? ""} onChange={(event) => update(record.staffId, { checkInTime: event.target.value })} /></span><span><input className="attendance-time-input" type="time" value={record.checkOutTime ?? ""} onChange={(event) => update(record.staffId, { checkOutTime: event.target.value })} /></span><small className={duration === "Invalid" ? "red-text" : ""}>{duration || "--"}</small></div> : <span className="muted">No hours</span>}
+      {showTime ? <div className="time-section"><span><TimePicker value={record.checkInTime ?? "09:30"} onChange={(time) => update(record.staffId, { checkInTime: time })} disabled={!showTime} /></span><span><TimePicker value={record.checkOutTime ?? "18:00"} onChange={(time) => update(record.staffId, { checkOutTime: time })} disabled={!showTime} /></span><small className={duration === "Invalid" ? "red-text" : ""}>{duration || "--"}</small></div> : <span className="muted">No hours</span>}
       <input value={record.notes ?? ""} onChange={(event) => update(record.staffId, { notes: event.target.value })} placeholder="Note" />
     </div>
   );
@@ -2445,8 +3581,13 @@ function MonthlySummary({ staff, attendance, customFrom }: { staff: Staff[]; att
   };
   return (
     <div className="attendance-panel">
-      <div className="attendance-head monthly-summary-head"><div className="month-nav-group"><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1)).slice(0, 7))}>Prev</button><input type="month" value={month} onChange={(event) => setMonth(event.target.value)} /><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1)).slice(0, 7))}>Next</button></div><button className="outline" onClick={exportRows}>Export Summary</button></div>
-      <div className="performance-cards"><div><span>Working Days</span><strong>{totalDays}</strong><small>Calendar days</small></div><div><span>Perfect Attendance</span><strong>{perfect}</strong><small>Staff at 100%</small></div><div><span>Avg Attendance</span><strong>{avg.toFixed(1)}%</strong><small>Across team</small></div><div><span>Most Absent</span><strong>{mostAbsent?.member.name ?? "None"}</strong><small>{mostAbsent?.absent ?? 0} absent days</small></div></div>
+      <div className="attendance-head monthly-summary-head"><div className="month-nav-group"><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1)).slice(0, 7))}>Prev</button><DatePicker value={`${month}-01`} onChange={(date) => date && setMonth(dateInputKey(date).slice(0, 7))} placeholder="MM/YYYY" /><button className="outline" onClick={() => setMonth(dateInputKey(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1)).slice(0, 7))}>Next</button></div><button className="outline" onClick={exportRows}>Export Summary</button></div>
+      <div className="performance-cards">
+        <CompactStatCard icon={<CalendarDays />} value={totalDays} label="Working Days" detail="Calendar days" />
+        <CompactStatCard icon={<Check />} value={perfect} label="Perfect Attendance" detail="Staff at 100%" />
+        <CompactStatCard icon={<BarChart3 />} value={`${avg.toFixed(1)}%`} label="Avg Attendance" detail="Across team" />
+        <CompactStatCard icon={<Users />} value={mostAbsent?.member.name ?? "None"} label="Most Absent" detail={`${mostAbsent?.absent ?? 0} absent days`} />
+      </div>
       <DataTable headers={["Staff", "Present", "Absent", "Half-Day", "Late", "Leave", "Hours", "Attendance %", "Salary Days"]}>{rows.map((row) => <tr key={row.member.id}><td>{row.member.name}</td><td>{row.present}</td><td>{row.absent}</td><td>{row.half}</td><td>{row.late}</td><td>{row.leave}</td><td>{row.hours.toFixed(1)}</td><td><span className={`attendance-percent ${row.percentage >= 90 ? "good" : row.percentage >= 75 ? "warn" : "bad"}`}>{row.percentage.toFixed(1)}%</span></td><td><input className="salary-days-input" type="number" defaultValue={row.salaryDays} /></td></tr>)}</DataTable>
     </div>
   );
@@ -2531,9 +3672,9 @@ function Reports() {
       <PageHeader title="Reports" subtitle="Sales, cash flow, expenses, and audit activity." action={<button className="primary" onClick={() => setExpenseOpen(true)}><Plus size={16} />Add Expense</button>} />
       <div className="tabs"><button className={period === "day" ? "active" : ""} onClick={() => setPeriod("day")}>Day Sales</button><button className={period === "week" ? "active" : ""} onClick={() => setPeriod("week")}>Weekly Sales</button><button className={period === "month" ? "active" : ""} onClick={() => setPeriod("month")}>Monthly Sales</button></div>
       <div className="cashflow-grid">
-        <div className="card cash-card"><span>Incoming Sales</span><strong>{INR.format(incoming)}</strong><small>{activeInvoices.length} invoices</small></div>
-        <div className="card cash-card"><span>Outgoing Expenses</span><strong>{INR.format(outgoing)}</strong><small>{activeExpenses.length} expenses</small></div>
-        <div className="card cash-card"><span>Net Cash Flow</span><strong className={netCash >= 0 ? "green-text" : "red-text"}>{INR.format(netCash)}</strong><small>{periodTitle}</small></div>
+        <CompactStatCard icon={<TrendingUp />} value={INR.format(incoming)} label="Incoming Sales" detail={`${activeInvoices.length} invoices`} />
+        <CompactStatCard icon={<ClipboardList />} value={INR.format(outgoing)} label="Outgoing Expenses" detail={`${activeExpenses.length} expenses`} />
+        <CompactStatCard icon={<BarChart3 />} value={INR.format(netCash)} valueClassName={netCash >= 0 ? "green-text" : "red-text"} label="Net Cash Flow" detail={periodTitle} />
       </div>
       <div className="report-grid">
         <div className="card chart-card report-chart-card"><h2>{periodTitle}</h2><RevenueChart data={chartData} xKey={chartKey} height={390} /></div>
@@ -2648,14 +3789,27 @@ function ProcurementScreen() {
     if (tab === "purchase-bills") { setBillEditing(null); setBillOpen(true); }
   };
   const confirmBill = (bill: PurchaseBill) => {
+    if (bill.stockAppliedAt) {
+      showToast(`${bill.billNo} already updated inventory`);
+      return;
+    }
     const status: PurchaseBill["status"] = bill.balanceDue <= 0 ? "paid" : bill.amountPaid > 0 ? "partial_paid" : "confirmed";
-    const confirmed = { ...bill, status };
+    const confirmed = { ...bill, status, stockAppliedAt: new Date().toISOString(), stockReversedAt: undefined };
     const stockUpdate = applyPurchaseBillStock(products, confirmed);
     setProducts(stockUpdate.products as Product[]);
     setStockMovements((items) => [...stockUpdate.movements, ...items]);
     setLedgerEntries((items) => entriesWithRunningBalance(items, createBillLedgerEntries(confirmed)));
     setPurchaseBills((items) => items.map((item) => item.id === bill.id ? confirmed : item));
     showToast(`${bill.billNo} confirmed`);
+  };
+  const deletePurchaseBill = (bill: PurchaseBill) => {
+    if (bill.stockAppliedAt && !bill.stockReversedAt) {
+      const reversal = reversePurchaseBillStock(products, bill);
+      setProducts(reversal.products as Product[]);
+      setStockMovements((items) => [...reversal.movements, ...items]);
+    }
+    setPurchaseBills((items) => items.filter((item) => item.id !== bill.id));
+    showToast(`${bill.billNo} deleted`);
   };
   const markPaid = (bill: PurchaseBill) => {
     const paymentAmount = bill.balanceDue;
@@ -2666,21 +3820,28 @@ function ProcurementScreen() {
     showToast(`${bill.billNo} marked paid`);
   };
   const savePurchaseBill = (bill: PurchaseBill) => {
-    setPurchaseBills((items) => billEditing ? items.map((item) => item.id === billEditing.id ? bill : item) : [bill, ...items]);
+    let nextBill = bill;
+    if (bill.status !== "draft" && !billEditing?.stockAppliedAt) {
+      nextBill = { ...bill, stockAppliedAt: new Date().toISOString(), stockReversedAt: undefined };
+      const stockUpdate = applyPurchaseBillStock(products, nextBill);
+      setProducts(stockUpdate.products as Product[]);
+      setStockMovements((items) => [...stockUpdate.movements, ...items]);
+    }
+    setPurchaseBills((items) => billEditing ? items.map((item) => item.id === billEditing.id ? nextBill : item) : [nextBill, ...items]);
     setLedgerEntries((items) => {
-      const withoutBill = items.filter((entry) => entry.referenceId !== bill.id && entry.referenceId !== bill.billNo);
-      const entries = [createPurchaseBillSummaryLedgerEntry(bill)];
+      const withoutBill = items.filter((entry) => entry.referenceId !== nextBill.id && entry.referenceId !== nextBill.billNo);
+      const entries = [createPurchaseBillSummaryLedgerEntry(nextBill)];
       return entriesWithRunningBalance(withoutBill, entries);
     });
     setBillOpen(false);
-    showToast(`${bill.billNo} saved`);
+    showToast(`${nextBill.billNo} saved`);
   };
 
   return (
     <section className="page tab-page">
       <PageHeader title="Procurement" subtitle="Manage suppliers, purchase orders, and purchased bills." action={<button className="primary" onClick={openNew}><Plus size={16} />{newLabel}</button>} />
       <div className="tab-bar"><button className={tab === "suppliers" ? "active" : ""} onClick={() => setTab("suppliers")}>Suppliers</button><button className={tab === "purchase-orders" ? "active" : ""} onClick={() => setTab("purchase-orders")}>Purchase orders</button><button className={tab === "purchase-bills" ? "active" : ""} onClick={() => setTab("purchase-bills")}>Purchased Bills</button></div>
-      <div className="cashflow-grid procurement-stats summary-fade">{statRows.map(([label, value]) => <div className="card cash-card" key={label}><span>{label}</span><strong>{value}</strong><small>{tab === "purchase-bills" ? "purchased bills" : tab.replace("-", " ")}</small></div>)}</div>
+      <div className="cashflow-grid procurement-stats summary-fade">{statRows.map(([label, value], index) => <CompactStatCard key={label} icon={[<Truck key="truck" />, <ClipboardList key="list" />, <BarChart3 key="chart" />, <Check key="check" />][index]} value={value} label={String(label)} detail={tab === "purchase-bills" ? "purchased bills" : tab.replace("-", " ")} />)}</div>
       {tab === "suppliers" ? <DataTable headers={["Name", "Contact", "Phone", "GSTIN", "Orders", "Balance", "Actions"]}>{suppliers.length ? suppliers.map((supplier) => {
         const orders = purchaseOrders.filter((po) => po.supplierId === supplier.id && po.status !== "cancelled");
         const balance = purchaseBills.filter((bill) => bill.supplierId === supplier.id).reduce((sum, bill) => sum + bill.balanceDue, 0);
@@ -2692,7 +3853,7 @@ function ProcurementScreen() {
       </> : null}
       {tab === "purchase-bills" ? <DataTable headers={["Bill No", "Date", "Supplier", "Invoice No", "Total", "Paid", "Paid On", "Balance", "Status", "Actions"]}>{purchaseBills.length ? purchaseBills.map((bill) => {
         const displayStatus = purchaseBillDisplayStatus(bill);
-        return <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td>{bill.paymentDate && (displayStatus === "paid" || displayStatus === "partial") ? formatDate(bill.paymentDate) : "-"}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${displayStatus}`}>{purchaseBillStatusLabel(displayStatus)}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setBillEditing(bill); setBillOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => setPurchaseBills((items) => items.filter((item) => item.id !== bill.id))}><Trash2 size={16} /></button></td></tr>;
+        return <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td>{bill.paymentDate && (displayStatus === "paid" || displayStatus === "partial") ? formatDate(bill.paymentDate) : "-"}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${displayStatus}`}>{purchaseBillStatusLabel(displayStatus)}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setBillEditing(bill); setBillOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => deletePurchaseBill(bill)}><Trash2 size={16} /></button></td></tr>;
       }) : <tr><td className="empty-table" colSpan={10}>No Data Available</td></tr>}</DataTable> : null}
       {supplierOpen ? <SupplierModal supplier={supplierEditing} onClose={() => setSupplierOpen(false)} onSave={(supplier) => { setSuppliers((items) => supplierEditing ? items.map((item) => item.id === supplierEditing.id ? supplier : item) : [supplier, ...items]); showToast(supplierEditing ? "Supplier updated" : "Supplier added"); setSupplierOpen(false); }} /> : null}
       {poOpen ? <PurchaseOrderModal po={poEditing} products={products} suppliers={suppliers} purchaseOrders={purchaseOrders} onClose={() => setPoOpen(false)} onSave={(po) => { setPurchaseOrders((items) => poEditing ? items.map((item) => item.id === poEditing.id ? po : item) : [po, ...items]); showToast(`${po.id} saved`); setPoOpen(false); }} /> : null}
@@ -2813,26 +3974,47 @@ function PurchaseBillsScreen() {
   const overdueBills = purchaseBills.filter((bill) => bill.balanceDue > 0 && bill.dueDate && new Date(bill.dueDate) < now).length;
 
   function saveBill(bill: PurchaseBill) {
-    setPurchaseBills((items) => editing ? items.map((item) => item.id === editing.id ? bill : item) : [bill, ...items]);
+    let nextBill = bill;
+    if (bill.status !== "draft" && !editing?.stockAppliedAt) {
+      nextBill = { ...bill, stockAppliedAt: new Date().toISOString(), stockReversedAt: undefined };
+      const stockUpdate = applyPurchaseBillStock(products, nextBill);
+      setProducts(stockUpdate.products as Product[]);
+      setStockMovements((items) => [...stockUpdate.movements, ...items]);
+    }
+    setPurchaseBills((items) => editing ? items.map((item) => item.id === editing.id ? nextBill : item) : [nextBill, ...items]);
     setLedgerEntries((items) => {
-      const withoutBill = items.filter((entry) => entry.referenceId !== bill.id && entry.referenceId !== bill.billNo);
-      const entries = [createPurchaseBillSummaryLedgerEntry(bill)];
+      const withoutBill = items.filter((entry) => entry.referenceId !== nextBill.id && entry.referenceId !== nextBill.billNo);
+      const entries = [createPurchaseBillSummaryLedgerEntry(nextBill)];
       return entriesWithRunningBalance(withoutBill, entries);
     });
     setOpen(false);
     setEditing(null);
-    showToast(`${bill.billNo} saved`);
+    showToast(`${nextBill.billNo} saved`);
   }
 
   function confirmBill(bill: PurchaseBill) {
+    if (bill.stockAppliedAt) {
+      showToast(`${bill.billNo} already updated inventory`);
+      return;
+    }
     const status: PurchaseBill["status"] = bill.balanceDue <= 0 ? "paid" : bill.amountPaid > 0 ? "partial_paid" : "confirmed";
-    const confirmed = { ...bill, status };
+    const confirmed = { ...bill, status, stockAppliedAt: new Date().toISOString(), stockReversedAt: undefined };
     const stockUpdate = applyPurchaseBillStock(products, confirmed);
     setProducts(stockUpdate.products as Product[]);
     setStockMovements((items) => [...stockUpdate.movements, ...items]);
     setLedgerEntries((items) => entriesWithRunningBalance(items, createBillLedgerEntries(confirmed)));
     setPurchaseBills((items) => items.map((item) => item.id === bill.id ? confirmed : item));
     showToast(`${bill.billNo} confirmed`);
+  }
+
+  function deleteBill(bill: PurchaseBill) {
+    if (bill.stockAppliedAt && !bill.stockReversedAt) {
+      const reversal = reversePurchaseBillStock(products, bill);
+      setProducts(reversal.products as Product[]);
+      setStockMovements((items) => [...reversal.movements, ...items]);
+    }
+    setPurchaseBills((items) => items.filter((item) => item.id !== bill.id));
+    showToast(`${bill.billNo} deleted`);
   }
 
   function markPaid(bill: PurchaseBill) {
@@ -2846,10 +4028,15 @@ function PurchaseBillsScreen() {
 
   return (
     <section className="page">
-      <PageHeader title="Purchase Bills" subtitle="Record supplier invoices and manage payables" action={<div className="toolbar"><select value={status} onChange={(event) => setStatus(event.target.value as PurchaseBill["status"] | "all")}><option value="all">All</option><option value="draft">Draft</option><option value="confirmed">Confirmed</option><option value="paid">Paid</option><option value="partial_paid">Partial Paid</option></select><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />New Bill</button></div>} />
-      <div className="cashflow-grid"><div className="card cash-card"><span>Total Payable</span><strong className="red-text">{INR.format(totalPayable)}</strong><small>Money owed</small></div><div className="card cash-card"><span>Paid This Month</span><strong className="green-text">{INR.format(paidThisMonth)}</strong><small>Supplier payments</small></div><div className="card cash-card"><span>Pending Bills</span><strong>{pendingBills}</strong><small>Bills with balance</small></div><div className="card cash-card"><span>Overdue Bills</span><strong className="red-text">{overdueBills}</strong><small>Past due date</small></div></div>
+      <PageHeader title="Purchase Bills" subtitle="Record supplier invoices and manage payables" action={<div className="toolbar"><select value={status} onChange={(event) => setStatus(event.target.value as PurchaseBill["status"] | "all")}><option value="all">All</option><option value="draft">Draft</option><option value="confirmed">Confirmed</option><option value="paid">Paid</option><option value="partial_paid">Partial Paid</option><option value="cancelled">Cancelled</option></select><button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />New Bill</button></div>} />
+      <div className="cashflow-grid">
+        <CompactStatCard icon={<ClipboardList />} value={INR.format(totalPayable)} valueClassName="red-text" label="Total Payable" detail="Money owed" />
+        <CompactStatCard icon={<Check />} value={INR.format(paidThisMonth)} valueClassName="green-text" label="Paid This Month" detail="Supplier payments" />
+        <CompactStatCard icon={<ClipboardList />} value={pendingBills} label="Pending Bills" detail="Bills with balance" />
+        <CompactStatCard icon={<AlertTriangle />} value={overdueBills} valueClassName="red-text" label="Overdue Bills" detail="Past due date" />
+      </div>
       <DataTable headers={["Bill No", "Date", "Supplier", "Invoice No", "Total", "Paid", "Balance", "Status", "Actions"]}>
-        {rows.length ? rows.map((bill) => <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${bill.status === "partial_paid" ? "partial" : bill.status}`}>{bill.status.replace("_", " ")}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(bill); setOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => setPurchaseBills((items) => items.filter((item) => item.id !== bill.id))}><Trash2 size={16} /></button></td></tr>) : <tr><td className="empty-table" colSpan={9}>No Data Available</td></tr>}
+        {rows.length ? rows.map((bill) => <tr key={bill.id}><td className="linkish">{bill.billNo}</td><td>{formatDate(bill.billDate)}</td><td>{bill.supplierName}</td><td>{bill.supplierInvoiceNo || "-"}</td><td><strong>{INR.format(bill.grandTotal)}</strong></td><td>{INR.format(bill.amountPaid)}</td><td><strong>{INR.format(bill.balanceDue)}</strong></td><td><span className={`po-status ${bill.status === "partial_paid" ? "partial" : bill.status}`}>{bill.status.replace("_", " ")}</span></td><td className="actions"><button title="View / Edit" onClick={() => { setEditing(bill); setOpen(true); }}><Eye size={16} /></button>{bill.status === "draft" ? <button title="Confirm Bill" onClick={() => confirmBill(bill)}><Check size={16} /></button> : null}{bill.balanceDue > 0 ? <button title="Mark Paid" onClick={() => markPaid(bill)}><IndianRupee size={16} /></button> : null}<button title="Delete" onClick={() => deleteBill(bill)}><Trash2 size={16} /></button></td></tr>) : <tr><td className="empty-table" colSpan={9}>No Data Available</td></tr>}
       </DataTable>
       {open ? <PurchaseBillModal bill={editing} bills={purchaseBills} purchaseOrders={purchaseOrders} suppliers={suppliers} products={products} onClose={() => setOpen(false)} onSave={saveBill} /> : null}
     </section>
@@ -2857,6 +4044,7 @@ function PurchaseBillsScreen() {
 }
 
 function PurchaseBillModal({ bill, bills, purchaseOrders, suppliers, products, onClose, onSave }: { bill: PurchaseBill | null; bills: PurchaseBill[]; purchaseOrders: PurchaseOrder[]; suppliers: Supplier[]; products: Product[]; onClose: () => void; onSave: (bill: PurchaseBill) => void }) {
+  const { showToast } = useApp();
   const [supplierId, setSupplierId] = useState(bill?.supplierId ?? suppliers[0]?.id ?? "");
   const [supplierName, setSupplierName] = useState(bill?.supplierName ?? suppliers[0]?.name ?? "");
   const [supplierInvoiceNo, setSupplierInvoiceNo] = useState(bill?.supplierInvoiceNo ?? "");
@@ -2870,6 +4058,7 @@ function PurchaseBillModal({ bill, bills, purchaseOrders, suppliers, products, o
   const [paidOn, setPaidOn] = useState(bill?.paymentDate ? dateKey(bill.paymentDate) : "");
   const [paidVia, setPaidVia] = useState<PurchaseBillPaidVia>(bill?.paidVia ?? (bill?.paymentMode && bill.paymentMode !== "credit" ? bill.paymentMode : ""));
   const [items, setItems] = useState<PurchaseBillItem[]>(bill?.items ?? (products[0] ? [buildPurchaseBillItem(products[0], 1, products[0].costPrice ?? products[0].price * 0.65)] : []));
+  const [attachments, setAttachments] = useState(bill?.attachments ?? []);
   const supplier = suppliers.find((item) => item.id === supplierId);
   const totals = totalsForPurchaseBill(items);
   const paid = paymentStatus === "paid" ? totals.grandTotal : paymentStatus === "unpaid" ? 0 : Math.min(totals.grandTotal, Number(amountPaid) || 0);
@@ -2918,12 +4107,59 @@ function PurchaseBillModal({ bill, bills, purchaseOrders, suppliers, products, o
     setItems((current) => current.map((item) => item.id === id ? { ...buildPurchaseBillItem(product, item.quantity, product.costPrice ?? product.price * 0.65), id } : item));
   }
 
+  async function importBillExcel(file?: File) {
+    if (!file) return;
+    const rows = await parseExcelBill(file);
+    const imported = rows.map((row) => {
+      const existing = products.find((product) =>
+        (row.sku && product.sku.toLowerCase() === row.sku.toLowerCase()) ||
+        product.name.toLowerCase() === row.productName.toLowerCase()
+      );
+      return existing
+        ? buildPurchaseBillItem(existing, row.quantity, row.unitCost || existing.costPrice || existing.price * 0.65)
+        : {
+          id: crypto.randomUUID(),
+          productName: row.productName,
+          sku: row.sku,
+          quantity: row.quantity,
+          unit: row.unit || "piece",
+          unitCost: row.unitCost,
+          gstRate: row.gstRate,
+          cgst: (row.quantity * row.unitCost * row.gstRate / 100) / 2,
+          sgst: (row.quantity * row.unitCost * row.gstRate / 100) / 2,
+          igst: 0,
+          lineTotal: row.quantity * row.unitCost * (1 + row.gstRate / 100),
+          updateStock: true,
+        };
+    });
+    setItems(imported);
+    showToast(`Imported ${imported.length} bill item${imported.length === 1 ? "" : "s"}`);
+  }
+
+  async function addAttachments(files: FileList | null) {
+    if (!files?.length) return;
+    const next = await Promise.all(Array.from(files).map(async (file) => ({
+      id: crypto.randomUUID(),
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      dataUrl: await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      }),
+      uploadedAt: new Date().toISOString(),
+    })));
+    setAttachments((items) => [...next, ...items]);
+  }
+
   function save(status: PurchaseBill["status"]) {
     const vendor = supplier?.name ?? supplierName.trim();
     if (!vendor || !items.length) return;
     const paymentDrivenStatus: PurchaseBill["status"] = status === "draft" ? "draft" : paymentStatus === "paid" ? "paid" : paymentStatus === "partial" ? "partial_paid" : "confirmed";
     const paymentDate = paid > 0 ? new Date(paidOn || new Date().toISOString()).toISOString() : undefined;
-    onSave({ id: bill?.id ?? crypto.randomUUID(), billNo: bill?.billNo ?? `BILL-${String(bills.length + 1).padStart(4, "0")}`, supplierId: supplier?.id, supplierName: vendor, supplierGSTIN: supplier?.gstin, supplierInvoiceNo, linkedPOId: linkedPOId || undefined, status: paymentDrivenStatus, items, ...totals, amountPaid: paid, balanceDue: Math.max(0, totals.grandTotal - paid), billDate: new Date(billDate).toISOString(), dueDate: dueDate ? new Date(dueDate).toISOString() : undefined, paymentMode: paidVia && paidVia !== "card" ? paidVia : paymentMode, paymentDate, paymentStatus, paidVia, reminders: autoReminderDates.map((reminder) => ({ days: reminder.days, date: reminder.date.toISOString(), triggered: false })), notes, createdBy: "Admin Owner", createdAt: bill?.createdAt ?? new Date().toISOString() });
+    onSave({ id: bill?.id ?? crypto.randomUUID(), billNo: bill?.billNo ?? `BILL-${String(bills.length + 1).padStart(4, "0")}`, supplierId: supplier?.id, supplierName: vendor, supplierGSTIN: supplier?.gstin, supplierInvoiceNo, linkedPOId: linkedPOId || undefined, status: paymentDrivenStatus, items, ...totals, amountPaid: paid, balanceDue: Math.max(0, totals.grandTotal - paid), billDate: new Date(billDate).toISOString(), dueDate: dueDate ? new Date(dueDate).toISOString() : undefined, paymentMode: paidVia && paidVia !== "card" ? paidVia : paymentMode, paymentDate, paymentStatus, paidVia, attachments, stockAppliedAt: bill?.stockAppliedAt, stockReversedAt: bill?.stockReversedAt, reminders: autoReminderDates.map((reminder) => ({ days: reminder.days, date: reminder.date.toISOString(), triggered: false })), notes, createdBy: "Admin Owner", createdAt: bill?.createdAt ?? new Date().toISOString() });
   }
 
   return (
@@ -2940,7 +4176,73 @@ function PurchaseBillModal({ bill, bills, purchaseOrders, suppliers, products, o
       </div>
       {paymentStatus === "partial" ? <div className="form-grid two"><TextField label="Amount Paid (₹)" type="number" value={amountPaid} onChange={setAmountPaid} /><label className="field"><span>Balance Due (₹)</span><input type="number" readOnly value={Math.max(0, totals.grandTotal - paid).toFixed(2)} /></label></div> : null}
       <label className="field"><span>Payment Mode</span><select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value as PurchaseBillPaymentMode)}><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="upi">UPI</option><option value="cheque">Cheque</option><option value="credit">Credit</option></select></label>
-      <div className="po-items"><div className="po-items-head"><strong>Items</strong><button className="outline" onClick={() => products[0] && setItems((current) => [...current, buildPurchaseBillItem(products[0], 1, products[0].costPrice ?? products[0].price * 0.65)])}>Add Item</button></div>{items.map((item) => <div className="po-item-row" key={item.id}><label><span>Product</span><select value={item.productId ?? ""} onChange={(event) => selectProduct(item.id, event.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label><label><span>Qty</span><input type="number" min="0" value={item.quantity} onChange={(event) => updateItem(item.id, { quantity: Number(event.target.value) || 0 })} /></label><label><span>Unit</span><input value={item.unit} onChange={(event) => updateItem(item.id, { unit: event.target.value })} /></label><label><span>Unit Cost</span><input type="number" min="0" value={item.unitCost} onChange={(event) => updateItem(item.id, { unitCost: Number(event.target.value) || 0 })} /></label><label><span>GST %</span><select value={item.gstRate} onChange={(event) => updateItem(item.id, { gstRate: Number(event.target.value) })}><option value={0}>0</option><option value={5}>5</option><option value={12}>12</option><option value={18}>18</option><option value={28}>28</option></select></label><label className="stock-checkbox-field"><span>Update Stock</span><input type="checkbox" checked={item.updateStock} onChange={(event) => updateItem(item.id, { updateStock: event.target.checked })} /></label><strong>{INR.format(item.lineTotal)}</strong><button className="danger-light" onClick={() => setItems((current) => current.filter((row) => row.id !== item.id))}>Remove</button><small>CGST {INR.format(item.cgst)} · SGST {INR.format(item.sgst)}</small></div>)}</div>
+      <div className="po-items purchase-bill-items">
+        <div className="po-items-head">
+          <strong>Items</strong>
+          <div className="inline-actions purchase-bill-item-actions">
+            <label className="outline file-button">
+              <Upload size={14} />
+              Upload Excel
+              <input type="file" accept=".xlsx,.xls,.csv" onChange={(event) => importBillExcel(event.target.files?.[0])} />
+            </label>
+            <button className="primary compact-action" onClick={() => products[0] && setItems((current) => [...current, buildPurchaseBillItem(products[0], 1, products[0].costPrice ?? products[0].price * 0.65)])}>
+              <Plus size={14} />
+              Add Item
+            </button>
+          </div>
+        </div>
+        {items.map((item) => (
+          <div className="purchase-bill-item-card" key={item.id}>
+            <div className="purchase-bill-item-row top">
+              <label>
+                <span>Product</span>
+                <select value={item.productId ?? ""} onChange={(event) => selectProduct(item.id, event.target.value)}>
+                  <option value="">{item.productName}</option>
+                  {products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>Qty</span>
+                <input type="number" min="0" value={item.quantity} onChange={(event) => updateItem(item.id, { quantity: Number(event.target.value) || 0 })} />
+              </label>
+              <label>
+                <span>Unit</span>
+                <input value={item.unit} onChange={(event) => updateItem(item.id, { unit: event.target.value })} />
+              </label>
+              <label>
+                <span>Unit Cost</span>
+                <input type="number" min="0" value={item.unitCost} onChange={(event) => updateItem(item.id, { unitCost: Number(event.target.value) || 0 })} />
+              </label>
+              <label>
+                <span>GST %</span>
+                <select value={item.gstRate} onChange={(event) => updateItem(item.id, { gstRate: Number(event.target.value) })}>
+                  <option value={0}>0%</option>
+                  <option value={5}>5%</option>
+                  <option value={12}>12%</option>
+                  <option value={18}>18%</option>
+                  <option value={28}>28%</option>
+                </select>
+              </label>
+              <button className="danger-light purchase-bill-remove" onClick={() => setItems((current) => current.filter((row) => row.id !== item.id))}>Remove</button>
+            </div>
+            <div className="purchase-bill-item-row bottom">
+              <div className="purchase-bill-gst-breakdown">
+                <span>CGST {INR.format(item.cgst)}</span>
+                <span>·</span>
+                <span>SGST {INR.format(item.sgst)}</span>
+              </div>
+              <label className="purchase-bill-stock-toggle">
+                <input type="checkbox" checked={item.updateStock} onChange={(event) => updateItem(item.id, { updateStock: event.target.checked })} />
+                <span>Update Stock</span>
+              </label>
+              <div className="purchase-bill-item-total">
+                <strong>{INR.format(item.lineTotal)}</strong>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="attachment-box"><div className="po-items-head"><strong>Bill Attachments</strong><label className="outline file-button"><Upload size={14} />Upload Image/PDF<input type="file" accept="image/*,.pdf" multiple onChange={(event) => addAttachments(event.target.files)} /></label></div>{attachments.length ? <div className="attachment-list">{attachments.map((file) => <a key={file.id} href={file.dataUrl} target="_blank" rel="noreferrer">{file.name}<span>{Math.round(file.size / 1024)} KB</span></a>)}</div> : <div className="empty compact">No attachments uploaded.</div>}</div>
       <div className="totals-box"><span>Subtotal <strong>{INR.format(totals.subtotal)}</strong></span><span>Total GST <strong>{INR.format(totals.totalGST)}</strong></span><span>Grand Total <strong>{INR.format(totals.grandTotal)}</strong></span><span>Balance Due <strong>{INR.format(Math.max(0, totals.grandTotal - paid))}</strong></span></div>
       {autoReminderDates.length ? <div className="payment-reminder-box auto-reminder-box"><div className="auto-reminder-title">Auto Payment Reminders Scheduled</div>{autoReminderDates.map((reminder) => {
         const isPast = reminder.date < new Date();
@@ -3022,7 +4324,11 @@ function ExpensesScreen() {
         <button className="primary" onClick={() => { setEditing(null); setOpen(true); }}><Plus size={16} />Add Expense</button>
         <div className="expenses-filter-inline"><DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} /></div>
       </div>
-      <div className="cashflow-grid"><div className="card cash-card"><span>Total Expenses</span><strong>{INR.format(total)}</strong><small>{periodExpenses.length} records</small></div><div className="card cash-card"><span>Largest Category</span><strong>{largest ? expenseCategoryLabels[largest[0] as ExpenseCategory] : "-"}</strong><small>{largest ? INR.format(largest[1]) : "No spend"}</small></div><div className="card cash-card"><span>Avg Daily Expense</span><strong>{INR.format(avgDaily)}</strong><small>Selected period</small></div></div>
+      <div className="cashflow-grid">
+        <CompactStatCard icon={<ClipboardList />} value={INR.format(total)} label="Total Expenses" detail={`${periodExpenses.length} records`} />
+        <CompactStatCard icon={<BarChart3 />} value={largest ? expenseCategoryLabels[largest[0] as ExpenseCategory] : "-"} label="Largest Category" detail={largest ? INR.format(largest[1]) : "No spend"} />
+        <CompactStatCard icon={<CalendarDays />} value={INR.format(avgDaily)} label="Avg Daily Expense" detail="Selected period" />
+      </div>
       <div className="report-grid"><div className="card"><h2>Category Breakdown</h2><div className="category-breakdown">{byCategory.map(([name, amount]) => <div className="category-row-item" key={name}><div><strong>{expenseCategoryLabel(name)}</strong><span>{Math.round((amount / Math.max(total, 1)) * 100)}%</span></div><div className="progress"><i style={{ width: `${Math.round((amount / Math.max(total, 1)) * 100)}%` }} /></div><b>{INR.format(amount)}</b></div>)}</div></div><div className="card chart-card"><h2>Monthly Expense Trend</h2><RevenueChart data={monthlyExpenseData} xKey="month" height={260} /></div></div>
       <div className="section-head"><h2>All Expenses</h2><label className="field compact"><select value={category} onChange={(event) => setCategory(event.target.value as "all" | ExpenseCategory)}><option value="all">All Categories</option>{Object.entries(expenseCategoryLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
       <DataTable headers={["Date", "Description", "Category", "Vendor", "Amount", "Payment", "Actions"]}>
@@ -3057,7 +4363,7 @@ function ExpenseEditorModal({ expense, expenses, onClose, onSave }: { expense: E
   );
 }
 
-function PnLScreen({ embedded = false }: { embedded?: boolean }) {
+function PnLScreen({ embedded = false, tabs }: { embedded?: boolean; tabs?: React.ReactNode }) {
   const { invoices, purchaseOrders, purchaseBills, expenses, products } = useApp();
   const [mode, setMode] = useState<DateRangeMode>("month");
   const [customFrom, setCustomFrom] = useState(dateKey(new Date().toISOString()));
@@ -3090,7 +4396,7 @@ function PnLScreen({ embedded = false }: { embedded?: boolean }) {
     const rows = pnlRows.map(([label, amount]) => `<tr><td>${label}</td><td class="amount">${INR.format(Number(amount))}</td></tr>`).join("");
     const w = window.open("", "_blank");
     if (w) {
-      w.document.write(`<!doctype html><html><head><title>P&L Report</title><style>body{font-family:Inter,Arial,sans-serif;padding:32px;color:#111827}h1{font-size:22px}table{width:100%;border-collapse:collapse}td{padding:10px 12px;border-bottom:1px solid #E5E7EB}.amount{text-align:right;font-weight:700}</style></head><body><h1>Profit & Loss Report</h1><p>${formatDate(range.from)} to ${formatDate(range.to)}</p><table>${rows}</table></body></html>`);
+      w.document.write(`<!doctype html><html><head><title>P&L Report</title><style>body{font-family:"Google Sans","DM Sans","Noto Sans",sans-serif;padding:32px;color:#111827}h1{font-size:22px}table{width:100%;border-collapse:collapse}td{padding:10px 12px;border-bottom:1px solid #E5E7EB}.amount{text-align:right;font-weight:600}</style></head><body><h1>Profit & Loss Report</h1><p>${formatDate(range.from)} to ${formatDate(range.to)}</p><table>${rows}</table></body></html>`);
       w.document.close();
       w.print();
     }
@@ -3098,11 +4404,13 @@ function PnLScreen({ embedded = false }: { embedded?: boolean }) {
   return (
     <section className={embedded ? "tab-page pnl-page" : "page pnl-page"}>
       {!embedded ? <PageHeader title="Profit & Loss" subtitle="Financial performance overview." /> : null}
-      <div className="pnl-toolbar-row">
-        <DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} />
-        <div className="pnl-export-actions"><button className="outline form-control" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary form-control" onClick={exportPDF}>Export PDF</button></div>
+      {tabs ? <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>{tabs}<div style={{ display: "flex", alignItems: "center", gap: "8px" }}>{(["today", "week", "month", "custom"] as DateRangeMode[]).map((item) => <button key={item} className={`chip ${mode === item ? "active" : ""}`} onClick={() => setMode(item)}>{item === "today" ? "Today" : item === "week" ? "This Week" : item === "month" ? "This Month" : "Custom"}</button>)}{mode === "custom" ? <><DatePicker value={customFrom} onChange={(date) => setCustomFrom(date ? dateInputKey(date) : "")} width="140px" /><span style={{ fontSize: "12px", color: "#6b7280" }}>→</span><DatePicker value={customTo} onChange={(date) => setCustomTo(date ? dateInputKey(date) : "")} width="140px" /></> : null}<button className="outline form-control" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary form-control" onClick={exportPDF}>Export PDF</button></div></div> : <div className="pnl-toolbar-row"><DateRangeFilter mode={mode} setMode={setMode} customFrom={customFrom} setCustomFrom={setCustomFrom} customTo={customTo} setCustomTo={setCustomTo} /><div className="pnl-export-actions"><button className="outline form-control" onClick={exportCSV}><Download size={16} />Export CSV</button><button className="primary form-control" onClick={exportPDF}>Export PDF</button></div></div>}
+      <div className="pnl-kpi-row">
+        <CompactStatCard icon={<TrendingUp />} value={INR.format(report.netRevenue)} label="Net Revenue" detail="Sales minus returns" />
+        <CompactStatCard icon={<BarChart3 />} value={INR.format(report.grossProfit)} valueClassName={report.grossProfit >= 0 ? "green-text" : "red-text"} label="Gross Profit" detail={`${report.grossMarginPct.toFixed(1)}% margin`} />
+        <CompactStatCard icon={<ClipboardList />} value={INR.format(report.totalExpenses)} label="Total Expenses" detail="Operating spend" />
+        <CompactStatCard icon={<TrendingUp />} value={INR.format(report.netProfit)} valueClassName={report.netProfit >= 0 ? "green-text" : "red-text"} label="Net Profit" detail={`${report.netMarginPct.toFixed(1)}% net margin`} />
       </div>
-      <div className="pnl-kpi-row"><div className="card cash-card pnl-kpi-card"><span>Net Revenue</span><strong>{INR.format(report.netRevenue)}</strong><small>Sales minus returns</small></div><div className="card cash-card pnl-kpi-card"><span>Gross Profit</span><strong className={report.grossProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.grossProfit)}</strong><small>{report.grossMarginPct.toFixed(1)}% margin</small></div><div className="card cash-card pnl-kpi-card"><span>Total Expenses</span><strong>{INR.format(report.totalExpenses)}</strong><small>Operating spend</small></div><div className="card cash-card pnl-kpi-card"><span>Net Profit</span><strong className={report.netProfit >= 0 ? "green-text" : "red-text"}>{INR.format(report.netProfit)}</strong><small>{report.netMarginPct.toFixed(1)}% net margin</small></div></div>
       <div className="report-grid"><div className="card pnl-statement"><h2>P&L Statement</h2><StatementSection title="Revenue" rows={[["Gross Sales", report.grossRevenue], ["Less: Returns", -report.returnsValue], ["Net Revenue", report.netRevenue]]} /><StatementSection title="Cost of Goods Sold" rows={[["Purchases", report.purchasesValue], ["Closing Stock", report.closingStock], ["Cost of Goods Sold", report.cogs]]} /><StatementSection title="Operating Expenses" rows={[...report.expensesByCategory.map((item) => [expenseCategoryLabels[item.category as ExpenseCategory] ?? item.category, item.amount] as [string, number]), ["Total Expenses", report.totalExpenses]]} /><StatementSection title="GST Summary" rows={[["Output GST", report.outputGST], ["Input GST", -report.inputGST], ["Net GST Payable", report.netGSTPayable]]} /><div className={`statement-total ${report.netProfit >= 0 ? "profit" : "loss"}`}><span>Net Profit</span><strong>{INR.format(report.netProfit)}</strong></div></div><div className="card chart-card"><h2>Revenue vs Expenses</h2><ResponsiveContainer width="100%" height={300}><BarChart data={monthlyData.map((item, index) => ({ month: item.month, revenue: item.revenue, expenses: 500 + index * 120, profit: item.revenue - (500 + index * 120) }))} barCategoryGap="16%" margin={{ top: 10, right: 20, left: 0, bottom: 0 }}><CartesianGrid vertical={false} stroke="#E5E7EB" /><XAxis dataKey="month" /><YAxis tickFormatter={(value) => `₹${Number(value) / 1000}k`} /><Tooltip formatter={(value) => INR.format(Number(value))} /><Bar dataKey="revenue" fill="#2563EB" radius={[4, 4, 0, 0]} maxBarSize={52} /><Bar dataKey="expenses" fill="#EF4444" radius={[4, 4, 0, 0]} maxBarSize={52} /></BarChart></ResponsiveContainer></div></div>
     </section>
   );
@@ -3110,13 +4418,17 @@ function PnLScreen({ embedded = false }: { embedded?: boolean }) {
 
 function FinancialsScreen() {
   const [tab, setTab] = useHashTab(["balance-sheet", "pl", "ledger"] as const, "balance-sheet");
+  const tabs = <FinancialTabs tab={tab} setTab={setTab} />;
   return (
-    <section className="page tab-page">
+    <section className="page tab-page financials-page">
       <PageHeader title="Financials" subtitle="Financial reports, position, and transaction history." />
-      <div className="tab-bar"><button className={tab === "balance-sheet" ? "active" : ""} onClick={() => setTab("balance-sheet")}>Balance sheet</button><button className={tab === "pl" ? "active" : ""} onClick={() => setTab("pl")}>P&L report</button><button className={tab === "ledger" ? "active" : ""} onClick={() => setTab("ledger")}>Ledger</button></div>
-      {tab === "balance-sheet" ? <BalanceSheetPanel /> : tab === "pl" ? <PnLScreen embedded /> : <LedgerPanel />}
+      {tab === "balance-sheet" ? <BalanceSheetPanel tabs={tabs} /> : tab === "pl" ? <PnLScreen embedded tabs={tabs} /> : <LedgerPanel tabs={tabs} />}
     </section>
   );
+}
+
+function FinancialTabs({ tab, setTab }: { tab: "balance-sheet" | "pl" | "ledger"; setTab: (tab: "balance-sheet" | "pl" | "ledger") => void }) {
+  return <div className="tab-bar"><button className={tab === "balance-sheet" ? "active" : ""} onClick={() => setTab("balance-sheet")}>Balance sheet</button><button className={tab === "pl" ? "active" : ""} onClick={() => setTab("pl")}>P&L report</button><button className={tab === "ledger" ? "active" : ""} onClick={() => setTab("ledger")}>Ledger</button></div>;
 }
 
 function BalanceSheetScreen() {
@@ -3128,7 +4440,7 @@ function BalanceSheetScreen() {
   );
 }
 
-function BalanceSheetPanel() {
+function BalanceSheetPanel({ tabs }: { tabs?: React.ReactNode }) {
   const { invoices, purchaseOrders, purchaseBills, expenses, products } = useApp();
   const [asOf, setAsOf] = useState(dateKey(new Date().toISOString()));
   const statement = computeBalanceSheetFromData({ asOfDate: new Date(asOf), sales: invoices, purchaseOrders, purchaseBills, expenses, products });
@@ -3136,7 +4448,7 @@ function BalanceSheetPanel() {
   const liabilities = statement.liabilities.currentLiabilities;
   return (
     <>
-      <div className="tab-toolbar"><DateInput value={asOf} onChange={(date) => setAsOf(date ? dateInputKey(date) : "")} style={{ height: "32px", borderRadius: "6px" }} /><button className="outline form-control push-right" onClick={() => window.print()}><Download size={16} />Export PDF</button></div>
+      {tabs ? <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>{tabs}<div style={{ display: "flex", alignItems: "center", gap: "10px" }}><DatePicker value={asOf} onChange={(date) => setAsOf(date ? dateInputKey(date) : "")} width="148px" style={{ height: "32px", borderRadius: "6px" }} /><button className="outline form-control" onClick={() => window.print()}><Download size={16} />Export PDF</button></div></div> : <div className="tab-toolbar"><DatePicker value={asOf} onChange={(date) => setAsOf(date ? dateInputKey(date) : "")} style={{ height: "32px", borderRadius: "6px" }} /><button className="outline form-control push-right" onClick={() => window.print()}><Download size={16} />Export PDF</button></div>}
       {!statement.isBalanced ? <div className="warning-banner"><AlertTriangle size={16} />Balance Sheet does not balance — check entries</div> : <div className="demo-box">Balance Sheet is balanced</div>}
       <div className="financial-grid">
         <div className="card pnl-statement">
@@ -3165,7 +4477,7 @@ function LedgerScreen() {
   );
 }
 
-function LedgerPanel() {
+function LedgerPanel({ tabs }: { tabs?: React.ReactNode }) {
   const { ledgerEntries, suppliers, customers } = useApp();
   const [accountType, setAccountType] = useState<AccountType | "all">("all");
   const [partyId, setPartyId] = useState("all");
@@ -3179,11 +4491,11 @@ function LedgerPanel() {
   }, {});
   return (
     <>
-      <div className="ledger-filter-row"><select className="form-control" value={accountType} onChange={(event) => setAccountType(event.target.value as AccountType | "all")}><option value="all">All Account Types</option>{(["cash", "bank", "upi", "sales", "purchases", "expenses", "supplier", "customer", "gst_output", "gst_input", "capital", "drawings"] as AccountType[]).map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}</select><select className="form-control" value={partyId} onChange={(event) => setPartyId(event.target.value)}><option value="all">All Parties</option>{parties.map((party) => <option key={party.id} value={party.id}>{party.name}</option>)}</select><label className="icon-input"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ledger" /></label><button className="outline form-control export-right" onClick={() => downloadCSV("ledger.csv", rows.map((entry) => ({ Date: formatDate(entry.date), Description: entry.description, Reference: entry.referenceId, Debit: entry.debit, Credit: entry.credit, Balance: entry.balance }))) }><Download size={16} />Export CSV</button></div>
+      {tabs ? <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>{tabs}<div style={{ display: "flex", alignItems: "center", gap: "10px" }}><select className="form-control" value={accountType} onChange={(event) => setAccountType(event.target.value as AccountType | "all")}><option value="all">All Account Types</option>{(["cash", "bank", "upi", "sales", "purchases", "expenses", "supplier", "customer", "gst_output", "gst_input", "capital", "drawings"] as AccountType[]).map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}</select><select className="form-control" value={partyId} onChange={(event) => setPartyId(event.target.value)}><option value="all">All Parties</option>{parties.map((party) => <option key={party.id} value={party.id}>{party.name}</option>)}</select><label className="icon-input"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ledger" /></label><button className="outline form-control export-right" onClick={() => downloadCSV("ledger.csv", rows.map((entry) => ({ Date: formatDate(entry.date), Description: entry.description, Reference: entry.referenceId, Debit: entry.debit, Credit: entry.credit, Balance: entry.balance }))) }><Download size={16} />Export CSV</button></div></div> : <div className="ledger-filter-row"><select className="form-control" value={accountType} onChange={(event) => setAccountType(event.target.value as AccountType | "all")}><option value="all">All Account Types</option>{(["cash", "bank", "upi", "sales", "purchases", "expenses", "supplier", "customer", "gst_output", "gst_input", "capital", "drawings"] as AccountType[]).map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}</select><select className="form-control" value={partyId} onChange={(event) => setPartyId(event.target.value)}><option value="all">All Parties</option>{parties.map((party) => <option key={party.id} value={party.id}>{party.name}</option>)}</select><label className="icon-input"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ledger" /></label><button className="outline form-control export-right" onClick={() => downloadCSV("ledger.csv", rows.map((entry) => ({ Date: formatDate(entry.date), Description: entry.description, Reference: entry.referenceId, Debit: entry.debit, Credit: entry.credit, Balance: entry.balance }))) }><Download size={16} />Export CSV</button></div>}
       {Object.entries(grouped).length ? Object.entries(grouped).map(([key, entries]) => {
         const [, name] = key.split(":");
         const closing = entries.reduce((sum, entry) => sum + entry.debit - entry.credit, 0);
-        return <div className="card" key={key}><div className="section-head"><h2>{name}</h2><strong>{INR.format(closing)}</strong></div><DataTable headers={["Date", "Description", "Reference", "Debit", "Credit", "Balance"]}>{entries.map((entry) => <tr key={entry.id}><td>{formatDate(entry.date)}</td><td>{entry.description}</td><td>{entry.referenceId}</td><td>{entry.debit ? INR.format(entry.debit) : "-"}</td><td>{entry.credit ? INR.format(entry.credit) : "-"}</td><td><strong className={entry.balance >= 0 ? "green-text" : "red-text"}>{INR.format(entry.balance)}</strong></td></tr>)}</DataTable></div>;
+        return <div className="card ledger-card" key={key}><div className="section-head ledger-section-head"><h2>{name}</h2><strong>{INR.format(closing)}</strong></div><DataTable headers={["Date", "Description", "Reference", "Debit", "Credit", "Balance"]}>{entries.map((entry) => <tr key={entry.id}><td>{formatDate(entry.date)}</td><td>{entry.description}</td><td>{entry.referenceId}</td><td>{entry.debit ? INR.format(entry.debit) : "-"}</td><td>{entry.credit ? INR.format(entry.credit) : "-"}</td><td><strong className={entry.balance >= 0 ? "green-text" : "red-text"}>{INR.format(entry.balance)}</strong></td></tr>)}</DataTable></div>;
       }) : <div className="empty compact">No ledger entries found.</div>}
     </>
   );
@@ -3235,7 +4547,7 @@ function StaffModal({ staff, onClose, onSave }: { staff: Staff | null; onClose: 
 
 function TextField({ label, value, onChange, placeholder, type = "text" }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; type?: string }) {
   if (type === "date") {
-    return <label className="field"><span>{label}</span><DateInput value={value} onChange={(date) => onChange(date ? dateInputKey(date) : "")} placeholder={placeholder} /></label>;
+    return <label className="field"><span>{label}</span><DatePicker value={value} onChange={(date) => onChange(date ? dateInputKey(date) : "")} placeholder={placeholder} /></label>;
   }
   return <label className="field"><span>{label}</span><input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} /></label>;
 }

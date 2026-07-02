@@ -3,6 +3,7 @@ import type { PurchaseOrder } from "../types/purchaseOrder";
 import type { PayablesSummary, PurchaseBill, PurchaseBillPaymentMode } from "../types/purchaseBill";
 import type { StockMovement } from "../types/stockMovement";
 import { createBillLedgerEntries, createBillPaymentLedgerEntries } from "../utils/createLedgerEntries";
+import { generateUniqueBarcode, generateUniqueSKU } from "../utils/generateProductCodes";
 
 let purchaseBills: PurchaseBill[] = [];
 
@@ -50,8 +51,14 @@ export const purchaseBillService = {
     const updated = await this.update(id, { amountPaid, balanceDue, status, paymentMode: payment.paymentMode, paymentDate: payment.paymentDate });
     return createBillPaymentLedgerEntries(updated, payment.amount);
   },
+  async cancel(id: string) {
+    const bill = await this.update(id, { status: "cancelled" });
+    return bill;
+  },
   async delete(id: string) {
+    const bill = await this.getById(id);
     purchaseBills = purchaseBills.filter((item) => item.id !== id);
+    return bill;
   },
   async generateBillNumber() {
     return `BILL-${String(purchaseBills.length + 1).padStart(4, "0")}`;
@@ -91,6 +98,61 @@ export function applyPurchaseBillStock(products: Product[], bill: PurchaseBill) 
       createdBy: bill.createdBy,
     })));
     return { ...product, stock, costPrice: unitCost };
+  });
+
+  bill.items.filter((item) => item.updateStock && !item.productId).forEach((item) => {
+    const id = crypto.randomUUID();
+    const product: Product = {
+      id,
+      name: item.productName,
+      sku: item.sku || generateUniqueSKU(item.productName || "GEN", nextProducts, id),
+      category: "Uncategorized",
+      gstRate: item.gstRate,
+      price: Math.round(item.unitCost * (1 + item.gstRate / 100) * 1.25 * 100) / 100,
+      stock: item.quantity,
+      costPrice: item.unitCost,
+      unitType: item.unit.toLowerCase().includes("kg") ? "kg" : item.unit.toLowerCase().includes("m") ? "meter" : item.unit.toLowerCase().includes("l") ? "liter" : "piece",
+      barcode: generateUniqueBarcode(nextProducts, id),
+    };
+    nextProducts.push(product);
+    movements.push({
+      id: `SM-${bill.id}-${item.id}`,
+      productId: product.id,
+      productName: product.name,
+      type: "purchase" as const,
+      quantity: item.quantity,
+      balanceAfter: product.stock,
+      referenceId: bill.id,
+      referenceType: "purchase_bill" as const,
+      date: new Date().toISOString(),
+      notes: `Purchase ${bill.billNo}`,
+      createdBy: bill.createdBy,
+    });
+  });
+  return { products: nextProducts, movements };
+}
+
+export function reversePurchaseBillStock(products: Product[], bill: PurchaseBill) {
+  const movements: StockMovement[] = [];
+  const nextProducts = products.map((product) => {
+    const billItems = bill.items.filter((item) => item.updateStock && item.productId === product.id);
+    if (!billItems.length) return product;
+    const removedQty = billItems.reduce((sum, item) => sum + item.quantity, 0);
+    const stock = Math.max(0, product.stock - removedQty);
+    movements.push(...billItems.map((item) => ({
+      id: `SM-REV-${bill.id}-${item.id}-${crypto.randomUUID()}`,
+      productId: product.id,
+      productName: product.name,
+      type: "adjustment" as const,
+      quantity: -item.quantity,
+      balanceAfter: stock,
+      referenceId: bill.id,
+      referenceType: "purchase_bill" as const,
+      date: new Date().toISOString(),
+      notes: `Reversal ${bill.billNo}`,
+      createdBy: bill.createdBy,
+    })));
+    return { ...product, stock };
   });
   return { products: nextProducts, movements };
 }

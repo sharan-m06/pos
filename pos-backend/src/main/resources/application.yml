@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: retailflow-pos
+  datasource:
+    url: jdbc:h2:file:${user.home}/RetailFlowPOS/retailflow;AUTO_SERVER=TRUE;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: retailflow
+    password: poslocal
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    database-platform: org.hibernate.dialect.H2Dialect
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  h2:
+    console:
+      enabled: false
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+server:
+  port: 8080
+jwt:
+  secret: ${JWT_SECRET:RetailFlow-Local-Secret-256BitsLong!}
+  expiration-ms: 86400000
+backup:
+  default-path: ${user.home}/RetailFlowPOS/backups/
+  auto-enabled: true
+  keep-local-count: 5
+  keep-local-days: 30
+  google-drive:
+    credentials-file: ${user.home}/RetailFlowPOS/google-credentials.json
+    folder-name: RetailFlowPOS-Backups
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

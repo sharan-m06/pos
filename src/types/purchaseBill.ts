@@ -1,4 +1,4 @@
-export type BillStatus = "draft" | "confirmed" | "paid" | "partial_paid";
+export type BillStatus = "draft" | "confirmed" | "paid" | "partial_paid" | "cancelled";
 export type PurchaseBillPaymentMode = "cash" | "bank_transfer" | "upi" | "cheque" | "credit";
 export type PurchaseBillPaymentStatus = "unpaid" | "partial" | "paid";
 export type PurchaseBillPaidVia = "cash" | "bank_transfer" | "upi" | "cheque" | "card" | "";
@@ -19,6 +19,15 @@ export interface PurchaseBillItem {
   igst: number;
   lineTotal: number;
   updateStock: boolean;
+}
+
+export interface PurchaseBillAttachment {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  dataUrl: string;
+  uploadedAt: string;
 }
 
 export interface PurchaseBill {
@@ -45,6 +54,9 @@ export interface PurchaseBill {
   paymentDate?: string;
   paymentStatus?: PurchaseBillPaymentStatus;
   paidVia?: PurchaseBillPaidVia;
+  attachments?: PurchaseBillAttachment[];
+  stockAppliedAt?: string;
+  stockReversedAt?: string;
   reminderEnabled?: boolean;
   remindOn?: string;
   reminderFreq?: PurchaseBillReminderFrequency;

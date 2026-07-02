@@ -1,0 +1,7 @@
+spring:
+  h2:
+    console:
+      enabled: true
+logging:
+  level:
+    com.retailflow.pos: DEBUG
